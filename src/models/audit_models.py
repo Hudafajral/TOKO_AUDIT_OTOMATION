@@ -1,7 +1,7 @@
 """
 src/models/audit_models.py
 Skema Database Relasional Toko Rina:
-Pelanggan, Piutang, Transaksi Kas Itemized, Mutasi Bank, Akun User & Izin Akses (dengan Status Approval & Lokasi IP),
+Pelanggan, Piutang, Transaksi Kas Itemized, Mutasi Bank, Akun User & Izin Akses (dengan Status Approval & Lokasi GPS/IP),
 Log Audit, Setting ML + Saldo Awal, dan Perpustakaan Dokumen.
 """
 from datetime import datetime
@@ -22,7 +22,9 @@ class User(Base):
     role = Column(String(20), default="kasir")
     status_approval = Column(String(20), default="APPROVED")  # 'PENDING', 'APPROVED', 'REJECTED'
     registered_ip = Column(String(50), default="127.0.0.1")
-    registered_location = Column(String(100), default="Lokal / Internal")
+    registered_location = Column(String(255), default="Lokal / Internal")
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
     # Daftar tab fitur yang diizinkan (format JSON list string)
     allowed_tabs = Column(Text, default='["homeDashboardTab","auditFormTab","docLibraryTab","piutangTab"]')
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -94,7 +96,9 @@ class AuditActionLog(Base):
     action_type = Column(String(50), nullable=False)
     description = Column(Text, nullable=False)
     client_ip = Column(String(50), nullable=True)
-    client_location = Column(String(100), default="Lokal / Internal")
+    client_location = Column(String(255), default="Lokal / Internal")
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
 

@@ -1,9 +1,9 @@
 """
 src/routers/web_router.py
 API Controller Keuangan POS Toko Rina:
-- Auto-migrasi skema database SQLite saat startup (termasuk status approval & lokasi IP)
-- Login dengan verifikasi status persetujuan Admin
-- Registrasi kasir baru dengan status PENDING dan deteksi IP/Lokasi
+- Auto-migrasi skema database SQLite saat startup (termasuk status approval & lokasi GPS/IP)
+- Login dengan verifikasi status persetujuan Admin & pelacakan lokasi
+- Registrasi kasir baru dengan status PENDING dan deteksi lokasi GPS perangkat
 - Endpoint Approve / Reject user & penghitungan pending badge counter
 - Dashboard Summary Kumulatif + Saldo Awal Baseline (Cash, Transfer, Utang)
 - Run Audit Presisi dengan Sinkronisasi Database
@@ -53,20 +53,48 @@ def get_db():
         db.close()
 
 
-def detect_client_info(request: Request) -> tuple[str, str]:
-    """Mendeteksi IP asli dan lokasi geografis sederhana klien."""
+def detect_client_info(
+    request: Request,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    client_loc_name: Optional[str] = None
+) -> tuple[str, str, Optional[float], Optional[float]]:
+    """Mendeteksi IP asli dan lokasi presisi pengguna berbasis GPS/IP."""
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
         client_ip = forwarded.split(",")[0].strip()
     else:
         client_ip = request.client.host if request.client else "127.0.0.1"
 
-    if client_ip in ["127.0.0.1", "localhost", "::1"] or client_ip.startswith("192.168.") or client_ip.startswith("10."):
-        return client_ip, "Lokal (Jaringan Toko Rina)"
+    # Prioritas 1: Jika client mengirim nama lokasi hasil reverse-geocoding GPS browser
+    if client_loc_name and client_loc_name.strip():
+        return client_ip, client_loc_name.strip(), lat, lon
 
+    # Prioritas 2: Jika ada koordinat GPS, coba reverse geocode via OSM
+    if lat is not None and lon is not None:
+        try:
+            url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}&zoom=14&addressdetails=1"
+            req = urllib.request.Request(url, headers={'User-Agent': 'TokoRinaAuditPOS/2.0'})
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                data = json.loads(resp.read().decode())
+                display = data.get("display_name", "")
+                addr = data.get("address", {})
+                kec = addr.get("suburb") or addr.get("city_district") or addr.get("town") or addr.get("village")
+                kota = addr.get("city") or addr.get("regency") or addr.get("state")
+                if kec and kota:
+                    return client_ip, f"{kec}, {kota}", lat, lon
+                elif display:
+                    return client_ip, display[:60], lat, lon
+        except Exception:
+            return client_ip, f"GPS ({lat:.4f}, {lon:.4f})", lat, lon
+
+    # Prioritas 3: Jaringan Internal/Localhost
+    if client_ip in ["127.0.0.1", "localhost", "::1"] or client_ip.startswith("192.168.") or client_ip.startswith("10."):
+        return client_ip, "Lokal (Jaringan Toko Rina)", lat, lon
+
+    # Prioritas 4: Lookup via IP Publik jika online
     location_str = "Indonesia"
     try:
-        # Coba ambil kota dari IP publik (timeout cepat 1 detik)
         req = urllib.request.Request(f"https://ipapi.co/{client_ip}/json/", headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=1.0) as resp:
             data = json.loads(resp.read().decode())
@@ -77,7 +105,7 @@ def detect_client_info(request: Request) -> tuple[str, str]:
     except Exception:
         pass
 
-    return client_ip, location_str
+    return client_ip, location_str, lat, lon
 
 
 @router.on_event("startup")
@@ -93,8 +121,12 @@ def on_startup():
             ("users", "allowed_tabs", "TEXT DEFAULT '[\"homeDashboardTab\",\"auditFormTab\",\"docLibraryTab\",\"piutangTab\"]'"),
             ("users", "status_approval", "VARCHAR(20) DEFAULT 'APPROVED'"),
             ("users", "registered_ip", "VARCHAR(50) DEFAULT '127.0.0.1'"),
-            ("users", "registered_location", "VARCHAR(100) DEFAULT 'Lokal / Internal'"),
-            ("audit_action_logs", "client_location", "VARCHAR(100) DEFAULT 'Lokal / Internal'")
+            ("users", "registered_location", "VARCHAR(255) DEFAULT 'Lokal / Internal'"),
+            ("users", "latitude", "FLOAT"),
+            ("users", "longitude", "FLOAT"),
+            ("audit_action_logs", "client_location", "VARCHAR(255) DEFAULT 'Lokal / Internal'"),
+            ("audit_action_logs", "latitude", "FLOAT"),
+            ("audit_action_logs", "longitude", "FLOAT")
         ]
         for tbl, col_name, col_type in cols_to_add:
             try:
@@ -114,7 +146,9 @@ def on_startup():
                 status_approval="APPROVED",
                 allowed_tabs='["*"]',
                 registered_ip="127.0.0.1",
-                registered_location="Sistem Utama"
+                registered_location="Sistem Utama (Server)",
+                latitude=-6.2917,
+                longitude=106.7170
             ))
         else:
             admin_u.role = "admin"
@@ -132,10 +166,13 @@ def index_page(request: Request):
     return templates.TemplateResponse(request=request, name="index.html", context={})
 
 
-# ================= AUTENTIKASI DENGAN APPROVAL & LOKASI IP =================
+# ================= AUTENTIKASI DENGAN APPROVAL & LOKASI GEOGRAFIS =================
 class AuthPayload(BaseModel):
     username: str
     password: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    location_name: Optional[str] = None
 
 
 @router.get("/api/check-user-status/{username}")
@@ -171,7 +208,9 @@ def login(payload: AuthPayload, request: Request, db: Session = Depends(get_db))
             detail="Permintaan akses akun Anda ditolak oleh Admin."
         )
 
-    client_ip, client_loc = detect_client_info(request)
+    client_ip, client_loc, lat, lon = detect_client_info(
+        request, lat=payload.latitude, lon=payload.longitude, client_loc_name=payload.location_name
+    )
 
     allowed = ["*"]
     if u.role != "admin":
@@ -185,7 +224,9 @@ def login(payload: AuthPayload, request: Request, db: Session = Depends(get_db))
         action_type="LOGIN",
         description=f"Pengguna '{u.username}' berhasil login ({client_loc})",
         client_ip=client_ip,
-        client_location=client_loc
+        client_location=client_loc,
+        latitude=lat,
+        longitude=lon
     ))
     db.commit()
     return {
@@ -194,7 +235,9 @@ def login(payload: AuthPayload, request: Request, db: Session = Depends(get_db))
         "role": u.role,
         "allowed_tabs": allowed,
         "client_ip": client_ip,
-        "client_location": client_loc
+        "client_location": client_loc,
+        "latitude": lat,
+        "longitude": lon
     }
 
 
@@ -209,7 +252,9 @@ def register_kasir(payload: AuthPayload, request: Request, db: Session = Depends
     if existing:
         raise HTTPException(status_code=400, detail="Username kasir sudah terdaftar!")
 
-    client_ip, client_loc = detect_client_info(request)
+    client_ip, client_loc, lat, lon = detect_client_info(
+        request, lat=payload.latitude, lon=payload.longitude, client_loc_name=payload.location_name
+    )
     default_permissions = json.dumps(["homeDashboardTab", "auditFormTab", "docLibraryTab", "piutangTab"])
 
     new_user = User(
@@ -219,6 +264,8 @@ def register_kasir(payload: AuthPayload, request: Request, db: Session = Depends
         status_approval="PENDING",  # WAJIB MENUNGGU PERSETUJUAN ADMIN
         registered_ip=client_ip,
         registered_location=client_loc,
+        latitude=lat,
+        longitude=lon,
         allowed_tabs=default_permissions
     )
     db.add(new_user)
@@ -227,21 +274,25 @@ def register_kasir(payload: AuthPayload, request: Request, db: Session = Depends
         action_type="USER_REGISTER",
         description=f"Kasir baru mendaftar: '{uname}' dari {client_ip} ({client_loc}). Menunggu persetujuan.",
         client_ip=client_ip,
-        client_location=client_loc
+        client_location=client_loc,
+        latitude=lat,
+        longitude=lon
     ))
     db.commit()
     return {
         "status": "SUCCESS", 
         "message": f"Pendaftaran berhasil! Akun '{uname}' sedang menunggu persetujuan (approval) dari Admin.",
         "client_ip": client_ip,
-        "client_location": client_loc
+        "client_location": client_loc,
+        "latitude": lat,
+        "longitude": lon
     }
 
 
 # ================= MANAJEMEN USER & APPROVAL (ADMIN ONLY) =================
 @router.get("/api/admin/users")
 def get_user_list(db: Session = Depends(get_db)):
-    """Mengambil daftar seluruh pengguna, IP, lokasi, status approval, dan hak akses."""
+    """Mengambil daftar seluruh pengguna, IP, lokasi, koordinat GPS, status approval, dan hak akses."""
     users = db.query(User).order_by(User.id.desc()).all()
     pending_count = db.query(User).filter(User.status_approval == "PENDING").count()
     out = []
@@ -258,6 +309,8 @@ def get_user_list(db: Session = Depends(get_db)):
             "status_approval": u.status_approval or "APPROVED",
             "registered_ip": u.registered_ip or "127.0.0.1",
             "registered_location": u.registered_location or "Lokal",
+            "latitude": getattr(u, "latitude", None),
+            "longitude": getattr(u, "longitude", None),
             "allowed_tabs": tabs,
             "created_at": u.created_at.strftime("%Y-%m-%d %H:%M") if u.created_at else "-"
         })
@@ -283,7 +336,7 @@ def set_user_approval(payload: UserApprovalPayload, request: Request, db: Sessio
         raise HTTPException(status_code=400, detail="Akun Admin utama tidak dapat diubah statusnya")
 
     target_user.status_approval = payload.status.upper()
-    client_ip, client_loc = detect_client_info(request)
+    client_ip, client_loc, lat, lon = detect_client_info(request)
 
     act_text = "MENYETUJUI" if payload.status.upper() == "APPROVED" else "MENOLAK"
     db.add(AuditActionLog(
@@ -291,7 +344,9 @@ def set_user_approval(payload: UserApprovalPayload, request: Request, db: Sessio
         action_type="USER_APPROVAL",
         description=f"Admin {act_text} aktivasi akun kasir '{target_user.username}'",
         client_ip=client_ip,
-        client_location=client_loc
+        client_location=client_loc,
+        latitude=lat,
+        longitude=lon
     ))
     db.commit()
     return {"status": "SUCCESS", "message": f"Status akun {target_user.username} berhasil diubah menjadi {target_user.status_approval}"}
@@ -313,13 +368,15 @@ def update_user_permissions(payload: UserPermissionPayload, request: Request, db
         raise HTTPException(status_code=400, detail="Hak akses akun Admin utama tidak dapat dibatasi")
 
     target_user.allowed_tabs = json.dumps(payload.allowed_tabs)
-    client_ip, client_loc = detect_client_info(request)
+    client_ip, client_loc, lat, lon = detect_client_info(request)
     db.add(AuditActionLog(
         username=payload.username_admin,
         action_type="PERMISSION_UPDATE",
         description=f"Admin memperbarui izin akses akun '{target_user.username}': {len(payload.allowed_tabs)} fitur aktif",
         client_ip=client_ip,
-        client_location=client_loc
+        client_location=client_loc,
+        latitude=lat,
+        longitude=lon
     ))
     db.commit()
     return {"status": "SUCCESS", "message": f"Izin akses untuk {target_user.username} berhasil disimpan"}
@@ -467,13 +524,15 @@ async def run_audit(
             model_max_age_days=cfg.model_max_age_days
         )
 
-        client_ip, client_loc = detect_client_info(request)
+        client_ip, client_loc, lat, lon = detect_client_info(request)
         db.add(AuditActionLog(
             username=username,
             action_type="AUDIT_RUN",
             description=f"Audit {audit_date}: Brankas Masuk=Rp {vault_in:,.0f}, Tunai PDF=Rp {total_cash_pdf:,.0f}, Selisih Kas=Rp {discrepancy:,.0f}",
             client_ip=client_ip,
-            client_location=client_loc
+            client_location=client_loc,
+            latitude=lat,
+            longitude=lon
         ))
 
         db.commit()
@@ -593,13 +652,15 @@ def set_initial_balances(payload: InitialBalancePayload, request: Request, db: S
     cfg.updated_by = payload.username
     cfg.updated_at = datetime.utcnow()
 
-    client_ip, client_loc = detect_client_info(request)
+    client_ip, client_loc, lat, lon = detect_client_info(request)
     db.add(AuditActionLog(
         username=payload.username,
         action_type="BALANCE_ADJUSTMENT",
         description=f"Penyesuaian Saldo Awal: Cash=Rp {payload.initial_cash:,.0f}, TF=Rp {payload.initial_transfer:,.0f}, Utang=Rp {payload.initial_debt:,.0f}",
         client_ip=client_ip,
-        client_location=client_loc
+        client_location=client_loc,
+        latitude=lat,
+        longitude=lon
     ))
     db.commit()
     return {"status": "SUCCESS", "message": "Saldo awal berhasil disimpan dan diterapkan!"}
@@ -626,13 +687,15 @@ def update_ml_settings(payload: MLSettingPayload, request: Request, db: Session 
     cfg.updated_by = payload.username
     cfg.updated_at = datetime.utcnow()
 
-    client_ip, client_loc = detect_client_info(request)
+    client_ip, client_loc, lat, lon = detect_client_info(request)
     db.add(AuditActionLog(
         username=payload.username,
         action_type="SETTING_UPDATE",
         description=f"Update Parameter ML: Limit Cash={payload.cash_hard_limit}, Limit Brankas={payload.vault_emergency_limit}, Age={payload.model_max_age_days} hari",
         client_ip=client_ip,
-        client_location=client_loc
+        client_location=client_loc,
+        latitude=lat,
+        longitude=lon
     ))
     db.commit()
     return {"status": "SUCCESS", "message": "Konfigurasi ML berhasil diperbarui"}
@@ -672,13 +735,15 @@ def batch_manual_match(payload: BatchManualMatchPayload, request: Request, db: S
     data["records"] = records
     mb_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    client_ip, client_loc = detect_client_info(request)
+    client_ip, client_loc, lat, lon = detect_client_info(request)
     db.add(AuditActionLog(
         username=payload.username,
         action_type="MANUAL_MATCH",
         description=f"Match Manual: {len(payload.selected_mutation_indices)} mutasi CR dipasangkan ke '{payload.target_customer_code or payload.target_receivable_id}' (Total Rp {matched_nominal_total:,.0f})",
         client_ip=client_ip,
-        client_location=client_loc
+        client_location=client_loc,
+        latitude=lat,
+        longitude=lon
     ))
     db.commit()
     return {"status": "SUCCESS", "matched_total": matched_nominal_total}
@@ -740,7 +805,9 @@ def get_audit_logs(db: Session = Depends(get_db)):
             "aksi": l.action_type,
             "deskripsi": l.description,
             "ip": l.client_ip or "-",
-            "lokasi": getattr(l, "client_location", "Lokal / Internal") or "Lokal"
+            "lokasi": getattr(l, "client_location", "Lokal / Internal") or "Lokal",
+            "lat": getattr(l, "latitude", None),
+            "lon": getattr(l, "longitude", None)
         }
         for l in logs
     ]

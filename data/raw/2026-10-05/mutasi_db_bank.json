@@ -19,9 +19,9 @@
       "keterangan": "TRSF E-BANKING CR 0510/FTSCY/WS95031         605000.00beras20kg dan gas TSHUN FUNG",
       "tipe": "CR",
       "nominal": 605000.0,
-      "status_matching": "UNMATCHED",
-      "matched_with": null,
-      "catatan_admin": ""
+      "status_matching": "MATCHED_MANUAL",
+      "matched_with": "BON-11",
+      "catatan_admin": "Match Manual Kasir/Admin"
     },
     {
       "id": 2,
@@ -119,9 +119,9 @@
       "keterangan": "TRSF E-BANKING CR 0510/FTSCY/WS95031         689000.00LINDA SUDARYADI",
       "tipe": "CR",
       "nominal": 689000.0,
-      "status_matching": "UNMATCHED",
-      "matched_with": null,
-      "catatan_admin": ""
+      "status_matching": "MATCHED_MANUAL",
+      "matched_with": "BON-5",
+      "catatan_admin": "Match Manual Kasir/Admin"
     },
     {
       "id": 12,
