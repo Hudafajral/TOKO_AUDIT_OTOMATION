@@ -1,8 +1,8 @@
 """
 src/models/audit_models.py
 Skema Database Relasional Toko Rina:
-Pelanggan, Piutang, Transaksi Kas Itemized, Mutasi Bank, Akun, Log Audit,
-Setting ML + Saldo Awal, dan Perpustakaan Dokumen.
+Pelanggan, Piutang, Transaksi Kas Itemized, Mutasi Bank, Akun User & Izin Akses (dengan Status Approval & Lokasi IP),
+Log Audit, Setting ML + Saldo Awal, dan Perpustakaan Dokumen.
 """
 from datetime import datetime
 from sqlalchemy import (
@@ -13,13 +13,18 @@ from src.database import Base
 
 
 class User(Base):
-    """Tabel Pengguna (1 Admin utama dan Kasir)."""
+    """Tabel Pengguna & Hak Akses Fitur Toko."""
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(50), unique=True, nullable=False)
     password_hash = Column(String(128), nullable=False)
     role = Column(String(20), default="kasir")
+    status_approval = Column(String(20), default="APPROVED")  # 'PENDING', 'APPROVED', 'REJECTED'
+    registered_ip = Column(String(50), default="127.0.0.1")
+    registered_location = Column(String(100), default="Lokal / Internal")
+    # Daftar tab fitur yang diizinkan (format JSON list string)
+    allowed_tabs = Column(Text, default='["homeDashboardTab","auditFormTab","docLibraryTab","piutangTab"]')
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -89,6 +94,7 @@ class AuditActionLog(Base):
     action_type = Column(String(50), nullable=False)
     description = Column(Text, nullable=False)
     client_ip = Column(String(50), nullable=True)
+    client_location = Column(String(100), default="Lokal / Internal")
     timestamp = Column(DateTime, default=datetime.utcnow)
 
 
@@ -154,10 +160,10 @@ class UploadedDocument(Base):
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String(200), nullable=False)
     file_path = Column(String(300), nullable=False)
-    file_type = Column(String(20), nullable=False)       # PDF, CSV, IMG, OTHER
+    file_type = Column(String(20), nullable=False)
     file_size_kb = Column(Float, default=0.0)
-    extra_info = Column(String(100), default="-")        # Rincian halaman / baris transaksi
-    doc_date = Column(String(20), nullable=False, index=True)  # YYYY-MM-DD
+    extra_info = Column(String(100), default="-")
+    doc_date = Column(String(20), nullable=False, index=True)
     upload_time = Column(String(10), default="12:00")
-    status = Column(String(30), default="Belum Diproses")  # 'Terproses' atau 'Belum Diproses'
+    status = Column(String(30), default="Belum Diproses")
     created_at = Column(DateTime, default=datetime.utcnow)
