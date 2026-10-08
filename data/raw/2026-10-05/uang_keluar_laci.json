@@ -1,0 +1,12 @@
+{
+  "date": "2026-10-05",
+  "total_nominal": 318000.0,
+  "input_by": "admin",
+  "items": [
+    {
+      "item_name": "Belanja Operasional",
+      "qty": 1,
+      "unit_price": 318000
+    }
+  ]
+}
