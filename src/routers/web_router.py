@@ -1,17 +1,20 @@
 """
 src/routers/web_router.py
 API Controller Keuangan POS Toko Rina:
-- Auto-migrasi skema database SQLite saat startup
+- Auto-migrasi skema database SQLite saat startup (termasuk status approval & lokasi IP)
+- Login dengan verifikasi status persetujuan Admin
+- Registrasi kasir baru dengan status PENDING dan deteksi IP/Lokasi
+- Endpoint Approve / Reject user & penghitungan pending badge counter
 - Dashboard Summary Kumulatif + Saldo Awal Baseline (Cash, Transfer, Utang)
 - Run Audit Presisi dengan Sinkronisasi Database
-- Perpustakaan Dokumen: Upload, List, Download (Auto-status), dan Toggle Status Manual
-- Pengaturan ML & Penyesuaian Saldo Baseline di Panel Admin
-- Resolusi Mutasi Manual & Master Data Pelanggan
+- Perpustakaan Dokumen: Upload, List, Download, Toggle Status
+- Audit Trail Terpisah & Pengaturan Saldo/ML Terpisah
 """
 from __future__ import annotations
 
 import io
 import json
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -50,30 +53,73 @@ def get_db():
         db.close()
 
 
+def detect_client_info(request: Request) -> tuple[str, str]:
+    """Mendeteksi IP asli dan lokasi geografis sederhana klien."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+    else:
+        client_ip = request.client.host if request.client else "127.0.0.1"
+
+    if client_ip in ["127.0.0.1", "localhost", "::1"] or client_ip.startswith("192.168.") or client_ip.startswith("10."):
+        return client_ip, "Lokal (Jaringan Toko Rina)"
+
+    location_str = "Indonesia"
+    try:
+        # Coba ambil kota dari IP publik (timeout cepat 1 detik)
+        req = urllib.request.Request(f"https://ipapi.co/{client_ip}/json/", headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            data = json.loads(resp.read().decode())
+            city = data.get("city")
+            region = data.get("region")
+            if city:
+                location_str = f"{city}, {region}" if region else city
+    except Exception:
+        pass
+
+    return client_ip, location_str
+
+
 @router.on_event("startup")
 def on_startup():
-    # 1. Pastikan seluruh tabel terbuat
     Base.metadata.create_all(bind=engine)
 
-    # 2. Migrasi Otomatis Kolom Baru: Mencegah 'no such column' di SQLite
+    # Migrasi Kolom Otomatis di SQLite
     with engine.connect() as conn:
         cols_to_add = [
-            ("initial_cash_balance", "FLOAT DEFAULT 0.0"),
-            ("initial_transfer_balance", "FLOAT DEFAULT 0.0"),
-            ("initial_debt_balance", "FLOAT DEFAULT 0.0")
+            ("ml_settings", "initial_cash_balance", "FLOAT DEFAULT 0.0"),
+            ("ml_settings", "initial_transfer_balance", "FLOAT DEFAULT 0.0"),
+            ("ml_settings", "initial_debt_balance", "FLOAT DEFAULT 0.0"),
+            ("users", "allowed_tabs", "TEXT DEFAULT '[\"homeDashboardTab\",\"auditFormTab\",\"docLibraryTab\",\"piutangTab\"]'"),
+            ("users", "status_approval", "VARCHAR(20) DEFAULT 'APPROVED'"),
+            ("users", "registered_ip", "VARCHAR(50) DEFAULT '127.0.0.1'"),
+            ("users", "registered_location", "VARCHAR(100) DEFAULT 'Lokal / Internal'"),
+            ("audit_action_logs", "client_location", "VARCHAR(100) DEFAULT 'Lokal / Internal'")
         ]
-        for col_name, col_type in cols_to_add:
+        for tbl, col_name, col_type in cols_to_add:
             try:
-                conn.execute(text(f"ALTER TABLE ml_settings ADD COLUMN {col_name} {col_type};"))
+                conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN {col_name} {col_type};"))
                 conn.commit()
             except Exception:
                 pass
 
-    # 3. Seed data default admin dan pengaturan awal
     db = SessionLocal()
     try:
-        if not db.query(User).filter(User.username == "admin").first():
-            db.add(User(username="admin", password_hash="admin123", role="admin"))
+        admin_u = db.query(User).filter(User.username == "admin").first()
+        if not admin_u:
+            db.add(User(
+                username="admin", 
+                password_hash="admin123", 
+                role="admin", 
+                status_approval="APPROVED",
+                allowed_tabs='["*"]',
+                registered_ip="127.0.0.1",
+                registered_location="Sistem Utama"
+            ))
+        else:
+            admin_u.role = "admin"
+            admin_u.status_approval = "APPROVED"
+            admin_u.allowed_tabs = '["*"]'
         if not db.query(MLSetting).first():
             db.add(MLSetting())
         db.commit()
@@ -86,58 +132,205 @@ def index_page(request: Request):
     return templates.TemplateResponse(request=request, name="index.html", context={})
 
 
-# ================= AUTENTIKASI =================
+# ================= AUTENTIKASI DENGAN APPROVAL & LOKASI IP =================
 class AuthPayload(BaseModel):
     username: str
     password: str
 
 
+@router.get("/api/check-user-status/{username}")
+def check_user_status(username: str, db: Session = Depends(get_db)):
+    """Memeriksa apakah akun sudah terdaftar dan status approval-nya untuk animasi gembok."""
+    uname = username.strip().lower()
+    u = db.query(User).filter(User.username == uname).first()
+    if not u:
+        return {"exists": False, "status": "NOT_FOUND"}
+    return {
+        "exists": True, 
+        "status": u.status_approval or "APPROVED",
+        "role": u.role
+    }
+
+
 @router.post("/api/login")
 def login(payload: AuthPayload, request: Request, db: Session = Depends(get_db)):
-    u = db.query(User).filter(User.username == payload.username, User.password_hash == payload.password).first()
+    uname = payload.username.strip().lower()
+    u = db.query(User).filter(User.username == uname, User.password_hash == payload.password).first()
     if not u:
-        raise HTTPException(status_code=401, detail="Username atau password salah")
+        raise HTTPException(status_code=401, detail="Username atau password salah!")
+
+    # Cek status approval
+    if u.role != "admin" and (u.status_approval or "").upper() == "PENDING":
+        raise HTTPException(
+            status_code=403, 
+            detail="Akun Anda sedang menunggu persetujuan Admin Toko Rina. Hubungi admin untuk aktivasi!"
+        )
+    if u.role != "admin" and (u.status_approval or "").upper() == "REJECTED":
+        raise HTTPException(
+            status_code=403, 
+            detail="Permintaan akses akun Anda ditolak oleh Admin."
+        )
+
+    client_ip, client_loc = detect_client_info(request)
+
+    allowed = ["*"]
+    if u.role != "admin":
+        try:
+            allowed = json.loads(u.allowed_tabs or '["homeDashboardTab","auditFormTab","docLibraryTab","piutangTab"]')
+        except Exception:
+            allowed = ["homeDashboardTab", "auditFormTab", "docLibraryTab", "piutangTab"]
 
     db.add(AuditActionLog(
         username=u.username,
         action_type="LOGIN",
-        description=f"Pengguna '{u.username}' berhasil login sebagai {u.role}",
-        client_ip=request.client.host if request.client else "127.0.0.1"
+        description=f"Pengguna '{u.username}' berhasil login ({client_loc})",
+        client_ip=client_ip,
+        client_location=client_loc
     ))
     db.commit()
-    return {"status": "SUCCESS", "username": u.username, "role": u.role}
+    return {
+        "status": "SUCCESS", 
+        "username": u.username, 
+        "role": u.role,
+        "allowed_tabs": allowed,
+        "client_ip": client_ip,
+        "client_location": client_loc
+    }
 
 
 @router.post("/api/register-kasir")
 def register_kasir(payload: AuthPayload, request: Request, db: Session = Depends(get_db)):
-    uname = payload.username.strip()
+    uname = payload.username.strip().lower()
     pwd = payload.password.strip()
-    if uname.lower() == "admin" or pwd == "admin123":
+    if uname == "admin" or pwd == "admin123":
         raise HTTPException(status_code=400, detail="Username/Password kasir tidak boleh sama dengan kredensial Admin!")
 
     existing = db.query(User).filter(User.username == uname).first()
     if existing:
-        raise HTTPException(status_code=400, detail="Username kasir sudah terdaftar")
+        raise HTTPException(status_code=400, detail="Username kasir sudah terdaftar!")
 
-    new_user = User(username=uname, password_hash=pwd, role="kasir")
+    client_ip, client_loc = detect_client_info(request)
+    default_permissions = json.dumps(["homeDashboardTab", "auditFormTab", "docLibraryTab", "piutangTab"])
+
+    new_user = User(
+        username=uname, 
+        password_hash=pwd, 
+        role="kasir",
+        status_approval="PENDING",  # WAJIB MENUNGGU PERSETUJUAN ADMIN
+        registered_ip=client_ip,
+        registered_location=client_loc,
+        allowed_tabs=default_permissions
+    )
     db.add(new_user)
     db.add(AuditActionLog(
         username="SYSTEM",
         action_type="USER_REGISTER",
-        description=f"Pendaftaran kasir baru: '{uname}'",
-        client_ip=request.client.host if request.client else "127.0.0.1"
+        description=f"Kasir baru mendaftar: '{uname}' dari {client_ip} ({client_loc}). Menunggu persetujuan.",
+        client_ip=client_ip,
+        client_location=client_loc
     ))
     db.commit()
-    return {"status": "SUCCESS", "message": f"Kasir {uname} berhasil didaftarkan"}
+    return {
+        "status": "SUCCESS", 
+        "message": f"Pendaftaran berhasil! Akun '{uname}' sedang menunggu persetujuan (approval) dari Admin.",
+        "client_ip": client_ip,
+        "client_location": client_loc
+    }
 
 
-# ================= DASHBOARD SUMMARY (KUMULATIF + SALDO AWAL) =================
+# ================= MANAJEMEN USER & APPROVAL (ADMIN ONLY) =================
+@router.get("/api/admin/users")
+def get_user_list(db: Session = Depends(get_db)):
+    """Mengambil daftar seluruh pengguna, IP, lokasi, status approval, dan hak akses."""
+    users = db.query(User).order_by(User.id.desc()).all()
+    pending_count = db.query(User).filter(User.status_approval == "PENDING").count()
+    out = []
+    for u in users:
+        tabs = []
+        try:
+            tabs = json.loads(u.allowed_tabs or "[]")
+        except Exception:
+            tabs = []
+        out.append({
+            "id": u.id,
+            "username": u.username,
+            "role": u.role,
+            "status_approval": u.status_approval or "APPROVED",
+            "registered_ip": u.registered_ip or "127.0.0.1",
+            "registered_location": u.registered_location or "Lokal",
+            "allowed_tabs": tabs,
+            "created_at": u.created_at.strftime("%Y-%m-%d %H:%M") if u.created_at else "-"
+        })
+    return {
+        "users": out,
+        "pending_count": pending_count
+    }
+
+
+class UserApprovalPayload(BaseModel):
+    user_id: int
+    status: str  # 'APPROVED' atau 'REJECTED'
+    username_admin: str = "admin"
+
+
+@router.put("/api/admin/users/approval")
+def set_user_approval(payload: UserApprovalPayload, request: Request, db: Session = Depends(get_db)):
+    """Menyetujui atau menolak akun kasir baru."""
+    target_user = db.query(User).filter(User.id == payload.user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Pengguna tidak ditemukan")
+    if target_user.role == "admin":
+        raise HTTPException(status_code=400, detail="Akun Admin utama tidak dapat diubah statusnya")
+
+    target_user.status_approval = payload.status.upper()
+    client_ip, client_loc = detect_client_info(request)
+
+    act_text = "MENYETUJUI" if payload.status.upper() == "APPROVED" else "MENOLAK"
+    db.add(AuditActionLog(
+        username=payload.username_admin,
+        action_type="USER_APPROVAL",
+        description=f"Admin {act_text} aktivasi akun kasir '{target_user.username}'",
+        client_ip=client_ip,
+        client_location=client_loc
+    ))
+    db.commit()
+    return {"status": "SUCCESS", "message": f"Status akun {target_user.username} berhasil diubah menjadi {target_user.status_approval}"}
+
+
+class UserPermissionPayload(BaseModel):
+    user_id: int
+    allowed_tabs: List[str]
+    username_admin: str = "admin"
+
+
+@router.put("/api/admin/users/permissions")
+def update_user_permissions(payload: UserPermissionPayload, request: Request, db: Session = Depends(get_db)):
+    """Mengubah hak akses tab mana saja yang boleh dilihat/digunakan pengguna."""
+    target_user = db.query(User).filter(User.id == payload.user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="Pengguna tidak ditemukan")
+    if target_user.role == "admin":
+        raise HTTPException(status_code=400, detail="Hak akses akun Admin utama tidak dapat dibatasi")
+
+    target_user.allowed_tabs = json.dumps(payload.allowed_tabs)
+    client_ip, client_loc = detect_client_info(request)
+    db.add(AuditActionLog(
+        username=payload.username_admin,
+        action_type="PERMISSION_UPDATE",
+        description=f"Admin memperbarui izin akses akun '{target_user.username}': {len(payload.allowed_tabs)} fitur aktif",
+        client_ip=client_ip,
+        client_location=client_loc
+    ))
+    db.commit()
+    return {"status": "SUCCESS", "message": f"Izin akses untuk {target_user.username} berhasil disimpan"}
+
+
+# ================= DASHBOARD SUMMARY =================
 @router.get("/api/dashboard-summary")
 def get_dashboard_summary(db: Session = Depends(get_db)):
     debts = get_all_debts_for_table(db, include_settled=True)
     total_debt = get_total_receivable_balance(db)
 
-    # Ambil baseline saldo awal toko dari tabel settings
     cfg = db.query(MLSetting).first()
     init_cash = float(getattr(cfg, "initial_cash_balance", 0.0) or 0.0) if cfg else 0.0
     init_tf = float(getattr(cfg, "initial_transfer_balance", 0.0) or 0.0) if cfg else 0.0
@@ -179,6 +372,8 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
             except Exception:
                 pass
 
+    pending_users = db.query(User).filter(User.status_approval == "PENDING").count()
+
     return {
         "total_cash_fisik": total_kumulatif_cash_brankas,
         "cash_brankas": total_kumulatif_cash_brankas,
@@ -188,6 +383,7 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
         "latest_db_items": latest_db_items,
         "unmatched_mutations": unmatched_mutations,
         "available_dates": available_dates,
+        "pending_registrations_count": pending_users,
         "initial_balances": {
             "cash": init_cash,
             "transfer": init_tf,
@@ -271,11 +467,13 @@ async def run_audit(
             model_max_age_days=cfg.model_max_age_days
         )
 
+        client_ip, client_loc = detect_client_info(request)
         db.add(AuditActionLog(
             username=username,
             action_type="AUDIT_RUN",
             description=f"Audit {audit_date}: Brankas Masuk=Rp {vault_in:,.0f}, Tunai PDF=Rp {total_cash_pdf:,.0f}, Selisih Kas=Rp {discrepancy:,.0f}",
-            client_ip=request.client.host if request.client else "127.0.0.1"
+            client_ip=client_ip,
+            client_location=client_loc
         ))
 
         db.commit()
@@ -300,7 +498,6 @@ async def run_audit(
 # ================= PERPUSTAKAAN DOKUMEN =================
 @router.get("/api/documents")
 def get_documents(db: Session = Depends(get_db)):
-    """Mengambil semua daftar dokumen arsip yang dikelompokkan."""
     docs = db.query(UploadedDocument).order_by(UploadedDocument.doc_date.desc(), UploadedDocument.id.desc()).all()
     return [
         {
@@ -323,7 +520,6 @@ async def upload_document(
     doc_date: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    """Unggah dokumen baru ke perpustakaan toko."""
     ext = file.filename.split(".")[-1].upper() if "." in file.filename else "FILE"
     ftype = "PDF" if ext == "PDF" else ("CSV" if ext == "CSV" else ("IMG" if ext in ["JPG", "JPEG", "PNG"] else "OTHER"))
 
@@ -352,7 +548,6 @@ async def upload_document(
 
 @router.get("/api/documents/{doc_id}/download")
 def download_document(doc_id: int, db: Session = Depends(get_db)):
-    """Unduh file dokumen fisik dan otomatis ubah status menjadi Terproses."""
     doc = db.query(UploadedDocument).filter(UploadedDocument.id == doc_id).first()
     if not doc or not Path(doc.file_path).exists():
         raise HTTPException(status_code=404, detail="Berkas file tidak ditemukan di sistem")
@@ -369,7 +564,6 @@ class StatusTogglePayload(BaseModel):
 
 @router.put("/api/documents/{doc_id}/status")
 def toggle_document_status(doc_id: int, payload: StatusTogglePayload, db: Session = Depends(get_db)):
-    """Ubah status pemrosesan dokumen secara manual."""
     doc = db.query(UploadedDocument).filter(UploadedDocument.id == doc_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
@@ -378,7 +572,7 @@ def toggle_document_status(doc_id: int, payload: StatusTogglePayload, db: Sessio
     return {"status": "SUCCESS", "current_status": doc.status}
 
 
-# ================= SET INITIAL BALANCES (PANEL ADMIN) =================
+# ================= SET INITIAL BALANCES =================
 class InitialBalancePayload(BaseModel):
     initial_cash: float = 0.0
     initial_transfer: float = 0.0
@@ -399,11 +593,13 @@ def set_initial_balances(payload: InitialBalancePayload, request: Request, db: S
     cfg.updated_by = payload.username
     cfg.updated_at = datetime.utcnow()
 
+    client_ip, client_loc = detect_client_info(request)
     db.add(AuditActionLog(
         username=payload.username,
         action_type="BALANCE_ADJUSTMENT",
         description=f"Penyesuaian Saldo Awal: Cash=Rp {payload.initial_cash:,.0f}, TF=Rp {payload.initial_transfer:,.0f}, Utang=Rp {payload.initial_debt:,.0f}",
-        client_ip=request.client.host if request.client else "127.0.0.1"
+        client_ip=client_ip,
+        client_location=client_loc
     ))
     db.commit()
     return {"status": "SUCCESS", "message": "Saldo awal berhasil disimpan dan diterapkan!"}
@@ -430,11 +626,13 @@ def update_ml_settings(payload: MLSettingPayload, request: Request, db: Session 
     cfg.updated_by = payload.username
     cfg.updated_at = datetime.utcnow()
 
+    client_ip, client_loc = detect_client_info(request)
     db.add(AuditActionLog(
         username=payload.username,
         action_type="SETTING_UPDATE",
         description=f"Update Parameter ML: Limit Cash={payload.cash_hard_limit}, Limit Brankas={payload.vault_emergency_limit}, Age={payload.model_max_age_days} hari",
-        client_ip=request.client.host if request.client else "127.0.0.1"
+        client_ip=client_ip,
+        client_location=client_loc
     ))
     db.commit()
     return {"status": "SUCCESS", "message": "Konfigurasi ML berhasil diperbarui"}
@@ -474,11 +672,13 @@ def batch_manual_match(payload: BatchManualMatchPayload, request: Request, db: S
     data["records"] = records
     mb_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    client_ip, client_loc = detect_client_info(request)
     db.add(AuditActionLog(
         username=payload.username,
         action_type="MANUAL_MATCH",
         description=f"Match Manual: {len(payload.selected_mutation_indices)} mutasi CR dipasangkan ke '{payload.target_customer_code or payload.target_receivable_id}' (Total Rp {matched_nominal_total:,.0f})",
-        client_ip=request.client.host if request.client else "127.0.0.1"
+        client_ip=client_ip,
+        client_location=client_loc
     ))
     db.commit()
     return {"status": "SUCCESS", "matched_total": matched_nominal_total}
@@ -531,7 +731,7 @@ def save_customer(payload: CustomerPayload, db: Session = Depends(get_db)):
 # ================= AUDIT LOGS & BERKAS ARSIP =================
 @router.get("/api/admin/audit-logs")
 def get_audit_logs(db: Session = Depends(get_db)):
-    logs = db.query(AuditActionLog).order_by(AuditActionLog.timestamp.desc()).limit(150).all()
+    logs = db.query(AuditActionLog).order_by(AuditActionLog.timestamp.desc()).limit(200).all()
     return [
         {
             "id": l.id,
@@ -539,7 +739,8 @@ def get_audit_logs(db: Session = Depends(get_db)):
             "username": l.username,
             "aksi": l.action_type,
             "deskripsi": l.description,
-            "ip": l.client_ip or "-"
+            "ip": l.client_ip or "-",
+            "lokasi": getattr(l, "client_location", "Lokal / Internal") or "Lokal"
         }
         for l in logs
     ]
