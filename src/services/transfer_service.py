@@ -1,10 +1,13 @@
 """
 src/services/transfer_service.py
-Layanan rekonsiliasi transfer bank Toko Rina.
-Urutan Eksekusi:
-1. Cek Penjualan Hari Ini di PDF (K.Debit & Bon Kredit Hari Ini).
-2. Jika tidak ada, cek Tabel Piutang database.
-3. Verifikasi nama & kode blok (D 20 vs H 36) agar tidak tertukar.
+Layanan rekonsiliasi transfer bank Toko Rina:
+- Mengekstrak nama pengirim asli mutasi bank BCA (teks setelah nominal .00)
+- Menghubungkan mutasi bank CR ke transaksi K.Debit hari ini HANYA jika:
+  1. Nominal sama persis, DAN
+  2. Nama pengirim mutasi benar-benar cocok dengan pelanggan
+- Mempertahankan riwayat pencocokan manual (MATCHED_MANUAL) yang sudah dilakukan pengguna
+  agar tidak tertimpa/hilang saat form audit dijalankan ulang.
+- Mencatat seluruh status ke mutasi_db_bank.json secara akurat.
 """
 from __future__ import annotations
 
@@ -15,12 +18,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
-from src.models.audit_models import Customer, Receivable
+from src.models.audit_models import Customer, CustomerAlias, Receivable
 from src.services.receivable_service import settle_receivable_direct
 
 
 def clean_text_normalize(text_val: Any) -> str:
-    """Normalisasi huruf Unicode ke alfabet Latin standar."""
+    """Normalisasi huruf Unicode ke alfabet Latin standar dan huruf kapital."""
     if text_val is None:
         return ""
     s = str(text_val)
@@ -46,25 +49,50 @@ def extract_block_code(text_val: str) -> Optional[str]:
     return None
 
 
-def is_strictly_matched(cust_name: str, desc_text: str) -> bool:
+def extract_sender_name(desc_text: str) -> str:
     """
-    Pencocokan presisi:
-    Wajib mencocokkan kode blok secara identik (D20 != H36).
+    Mengekstrak nama pengirim asli dari teks mutasi bank BCA.
+    Mengambil bagian setelah nominal dan pecahan desimal (.00).
     """
-    cust_clean = clean_text_normalize(cust_name)
-    desc_clean = clean_text_normalize(desc_text)
-    desc_compact = desc_clean.replace(" ", "")
+    raw = str(desc_text or "").strip()
+    m = re.search(r"\d+\.00\s*(.*)", raw)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
 
-    c_block = extract_block_code(cust_clean)
-    if c_block:
-        d_block = extract_block_code(desc_clean)
-        if d_block and d_block != c_block:
-            return False
-        block_spaced = f"{c_block[0]} {c_block[1:]}"
-        return (c_block in desc_compact) or (block_spaced in desc_clean)
+    parts = raw.split("/")
+    if len(parts) > 1 and parts[-1].strip():
+        return parts[-1].strip()
 
-    cust_compact = cust_clean.replace(" ", "")
-    return (cust_compact in desc_compact) if len(cust_compact) >= 4 else False
+    return raw
+
+
+def is_name_or_block_matched(cust_identifier: str, sender_raw_text: str) -> bool:
+    """
+    Mengecek kecocokan antara identitas pelanggan dengan nama pengirim mutasi.
+    Menggunakan batas kata utuh (\b) agar tidak salah mendeteksi substring tunggal.
+    """
+    clean_cust = clean_text_normalize(cust_identifier)
+    clean_sender = clean_text_normalize(sender_raw_text)
+
+    if not clean_cust or not clean_sender:
+        return False
+
+    # 1. Cek kode blok jika format huruf + angka
+    cust_block = extract_block_code(clean_cust)
+    sender_block = extract_block_code(clean_sender)
+    if cust_block and sender_block and cust_block == sender_block:
+        return True
+
+    # 2. Cek kesamaan persis (cocok untuk kode 1 huruf seperti 'A', 'B', dsb)
+    if clean_cust == clean_sender:
+        return True
+
+    # 3. Cek batas kata utuh (\b)
+    pattern = r"\b" + re.escape(clean_cust) + r"\b"
+    if re.search(pattern, clean_sender):
+        return True
+
+    return False
 
 
 def reconcile_daily_bank_mutations(
@@ -77,6 +105,18 @@ def reconcile_daily_bank_mutations(
     folder_path.mkdir(parents=True, exist_ok=True)
     mb_file = folder_path / "mutasi_db_bank.json"
 
+    # PERTAHANKAN MATCH MANUAL SEBELUMNYA JIKA SUDAH ADA
+    existing_manual_matches = {}
+    if mb_file.exists():
+        try:
+            old_data = json.loads(mb_file.read_text(encoding="utf-8"))
+            for old_r in old_data.get("records", []):
+                if old_r.get("status_matching") == "MATCHED_MANUAL":
+                    key = f"{old_r.get('tanggal')}_{old_r.get('keterangan')}_{float(old_r.get('nominal', 0.0))}"
+                    existing_manual_matches[key] = old_r
+        except Exception:
+            pass
+
     db.flush()
 
     # 1. Siapkan K.Debit Penjualan Hari Ini dari PDF
@@ -85,9 +125,9 @@ def reconcile_daily_bank_mutations(
     today_credit_sales = []
 
     for s in today_sales:
-        c_code = str(s.get("customer_code") or "").strip()
-        k_deb = float(s.get("k_debit") or s.get("debit") or 0.0)
-        k_kred = float(s.get("kredit") or s.get("credit") or 0.0)
+        c_code = str(s.get("customer_code") or s.get("customer") or s.get("pelanggan") or s.get("kode_pelanggan") or "").strip()
+        k_deb = float(s.get("k_debit") or s.get("debit") or s.get("jml_bayar_k_debit") or 0.0)
+        k_kred = float(s.get("kredit") or s.get("credit") or s.get("jml_bayar_kredit") or 0.0)
 
         if k_deb > 0 and c_code:
             today_debit_sales.append({
@@ -116,15 +156,42 @@ def reconcile_daily_bank_mutations(
             "is_settled": False
         })
 
+    # 4. Ambil Kamus Nama dan Alias Pelanggan dari Master Data
+    alias_dict: Dict[str, List[str]] = {}
+    for c in db.query(Customer).all():
+        c_code_clean = clean_text_normalize(c.customer_code)
+        if c_code_clean not in alias_dict:
+            alias_dict[c_code_clean] = []
+        if c.name:
+            alias_dict[c_code_clean].append(clean_text_normalize(c.name))
+        alias_dict[c_code_clean].append(c_code_clean)
+
+    for a in db.query(CustomerAlias).all():
+        if a.customer and a.alias_name:
+            c_code_clean = clean_text_normalize(a.customer.customer_code)
+            if c_code_clean not in alias_dict:
+                alias_dict[c_code_clean] = []
+            alias_dict[c_code_clean].append(clean_text_normalize(a.alias_name))
+
     reconciled_records = []
     unmatched_transfers = []
 
-    # 4. Rekonsiliasi Setiap Baris Mutasi Bank
+    # 5. Rekonsiliasi Setiap Baris Mutasi Bank
     for idx, m in enumerate(mutations):
         m_date = str(m.get("date") or audit_date)
         m_desc = str(m.get("description") or "")
         m_type = str(m.get("type") or "CR").upper()
         m_amount = float(m.get("amount") or 0.0)
+
+        # Cek apakah baris ini sebelumnya sudah dimatch manual oleh pengguna
+        match_key = f"{m_date}_{m_desc}_{m_amount}"
+        if match_key in existing_manual_matches:
+            saved_rec = existing_manual_matches[match_key]
+            saved_rec["id"] = idx
+            reconciled_records.append(saved_rec)
+            continue
+
+        sender_name_only = extract_sender_name(m_desc)
 
         record_entry = {
             "id": idx,
@@ -144,61 +211,74 @@ def reconcile_daily_bank_mutations(
             continue
 
         # =========================================================
-        # TAHAP 1: CEK PENJUALAN HARI INI (BON / K.DEBIT PDF)
+        # TAHAP 1: PRIORITAS PELUNASAN BON HARI INI
         # =========================================================
-        matched_today = False
-
-        # 1A. Cek Pembayaran Bon Hari Ini (misal PASADENA D 20)
+        matched_debt_today = False
         for cs in today_credit_sales:
             if cs["is_matched"]:
                 continue
             if abs(cs["nominal"] - m_amount) < 1.0:
-                if is_strictly_matched(cs["customer_code"], m_desc):
+                c_clean = clean_text_normalize(cs["customer_code"])
+                possible_names = alias_dict.get(c_clean, [c_clean])
+                name_matches = any(is_name_or_block_matched(n, sender_name_only) for n in possible_names)
+
+                if name_matches:
                     cs["is_matched"] = True
-                    matched_today = True
+                    matched_debt_today = True
                     record_entry["status_matching"] = "MATCHED_DEBT_SETTLED"
                     record_entry["matched_with"] = f"{cs['customer_code']} (Bon PDF Hari Ini)"
                     record_entry["catatan_admin"] = f"Pelunasan Bon Hari Ini ({cs['customer_code']})"
 
-                    # Update status piutang tanggal hari ini menjadi LUNAS
                     for d in debt_items:
                         if not d["is_settled"] and d["sale_date"] == audit_date:
-                            if is_strictly_matched(d["customer_code"], cs["customer_code"]):
+                            if clean_text_normalize(d["customer_code"]) == c_clean:
                                 d["is_settled"] = True
                                 settle_receivable_direct(db, d["id"], m_amount, audit_date)
                                 break
                     break
 
-        if matched_today:
+        if matched_debt_today:
             reconciled_records.append(record_entry)
             continue
 
-        # 1B. Cek Transaksi K.Debit Hari Ini
+        # =========================================================
+        # TAHAP 2: COCOKKAN KE TRANSAKSI K.DEBIT HARI INI
+        # =========================================================
+        matched_sales = False
         for ds in today_debit_sales:
             if ds["is_matched"]:
                 continue
             if abs(ds["nominal"] - m_amount) < 1.0:
-                if is_strictly_matched(ds["customer_code"], m_desc):
+                c_clean = clean_text_normalize(ds["customer_code"])
+                possible_names = alias_dict.get(c_clean, [c_clean])
+
+                has_valid_name = any(is_name_or_block_matched(n, sender_name_only) for n in possible_names)
+
+                if has_valid_name:
                     ds["is_matched"] = True
-                    matched_today = True
+                    matched_sales = True
                     record_entry["status_matching"] = "MATCHED_SALES_DEBIT"
                     record_entry["matched_with"] = ds["customer_code"]
                     record_entry["catatan_admin"] = f"K.Debit POS ({ds['customer_code']})"
                     break
 
-        if matched_today:
+        if matched_sales:
             reconciled_records.append(record_entry)
             continue
 
         # =========================================================
-        # TAHAP 2: CEK TABEL PIUTANG DATABASE LAMA
+        # TAHAP 3: COCOKKAN KE TABEL PIUTANG DATABASE LAMA
         # =========================================================
         matched_old_debt = False
         for d in debt_items:
             if d["is_settled"]:
                 continue
             if abs(d["remaining_amount"] - m_amount) < 1.0 or m_amount <= d["remaining_amount"]:
-                if is_strictly_matched(d["customer_code"], m_desc):
+                d_clean = clean_text_normalize(d["customer_code"])
+                possible_names = alias_dict.get(d_clean, [d_clean])
+                has_match = any(is_name_or_block_matched(n, sender_name_only) for n in possible_names)
+
+                if has_match:
                     d["is_settled"] = True
                     matched_old_debt = True
                     record_entry["status_matching"] = "MATCHED_DEBT_SETTLED"

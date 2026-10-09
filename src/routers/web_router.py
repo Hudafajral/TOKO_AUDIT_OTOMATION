@@ -1,19 +1,25 @@
 """
 src/routers/web_router.py
 API Controller Keuangan POS Toko Rina:
-- Auto-migrasi skema database SQLite saat startup (termasuk status approval & lokasi GPS/IP)
-- Login dengan verifikasi status persetujuan Admin & pelacakan lokasi
-- Registrasi kasir baru dengan status PENDING dan deteksi lokasi GPS perangkat
-- Endpoint Approve / Reject user & penghitungan pending badge counter
-- Dashboard Summary Kumulatif + Saldo Awal Baseline (Cash, Transfer, Utang)
-- Run Audit Presisi dengan Sinkronisasi Database
-- Perpustakaan Dokumen: Upload, List, Download, Toggle Status
-- Audit Trail Terpisah & Pengaturan Saldo/ML Terpisah
+- Auto-migrasi skema database SQLite saat startup
+- Autentikasi dengan approval Admin & geolokasi GPS/IP
+- Run Audit Presisi dengan sinkronisasi mutasi dan piutang
+- Evaluasi Machine Learning Risk Engine menggunakan Sisa Selisih Kas Bersih
+  (mencegah pembengkakan ganda uang fisik dari penyesuaian kas manual)
+- Resolusi Mutasi Manual Batch dengan alokasi sisa saldo mutasi & format manual(pelanggan(nominal))
+- Generator Laporan Audit Harian Dinamis:
+  * Header: CASH LAPORAN, DEBIT LAPORAN, DEBIT MUTASI (total CR bank)
+  * Rekap Cash Fisik murni: Masuk Brankas + Keluar Laci
+  * Kotak ringkasan: Selisih, Keterangan, Sisa Selisih, dan Status Mutasi Debit
+  * Auto-Sync Real-time ke Tab Perpustakaan Dokumen
+- Manajemen Data: Edit & Hapus untuk Dokumen, Pelanggan, dan User
+- Penanganan pratinjau tab baru (inline) untuk dokumen HTML
 """
 from __future__ import annotations
 
 import io
 import json
+import re
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -59,40 +65,34 @@ def detect_client_info(
     lon: Optional[float] = None,
     client_loc_name: Optional[str] = None
 ) -> tuple[str, str, Optional[float], Optional[float]]:
-    """Mendeteksi IP asli dan lokasi presisi pengguna berbasis GPS/IP."""
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
         client_ip = forwarded.split(",")[0].strip()
     else:
         client_ip = request.client.host if request.client else "127.0.0.1"
 
-    # Prioritas 1: Jika client mengirim nama lokasi hasil reverse-geocoding GPS browser
     if client_loc_name and client_loc_name.strip():
         return client_ip, client_loc_name.strip(), lat, lon
 
-    # Prioritas 2: Jika ada koordinat GPS, coba reverse geocode via OSM
     if lat is not None and lon is not None:
         try:
             url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}&zoom=14&addressdetails=1"
             req = urllib.request.Request(url, headers={'User-Agent': 'TokoRinaAuditPOS/2.0'})
             with urllib.request.urlopen(req, timeout=1.5) as resp:
                 data = json.loads(resp.read().decode())
-                display = data.get("display_name", "")
                 addr = data.get("address", {})
                 kec = addr.get("suburb") or addr.get("city_district") or addr.get("town") or addr.get("village")
                 kota = addr.get("city") or addr.get("regency") or addr.get("state")
                 if kec and kota:
                     return client_ip, f"{kec}, {kota}", lat, lon
-                elif display:
-                    return client_ip, display[:60], lat, lon
+                elif data.get("display_name"):
+                    return client_ip, data.get("display_name")[:60], lat, lon
         except Exception:
             return client_ip, f"GPS ({lat:.4f}, {lon:.4f})", lat, lon
 
-    # Prioritas 3: Jaringan Internal/Localhost
     if client_ip in ["127.0.0.1", "localhost", "::1"] or client_ip.startswith("192.168.") or client_ip.startswith("10."):
         return client_ip, "Lokal (Jaringan Toko Rina)", lat, lon
 
-    # Prioritas 4: Lookup via IP Publik jika online
     location_str = "Indonesia"
     try:
         req = urllib.request.Request(f"https://ipapi.co/{client_ip}/json/", headers={'User-Agent': 'Mozilla/5.0'})
@@ -112,7 +112,6 @@ def detect_client_info(
 def on_startup():
     Base.metadata.create_all(bind=engine)
 
-    # Migrasi Kolom Otomatis di SQLite
     with engine.connect() as conn:
         cols_to_add = [
             ("ml_settings", "initial_cash_balance", "FLOAT DEFAULT 0.0"),
@@ -166,7 +165,7 @@ def index_page(request: Request):
     return templates.TemplateResponse(request=request, name="index.html", context={})
 
 
-# ================= AUTENTIKASI DENGAN APPROVAL & LOKASI GEOGRAFIS =================
+# ================= AUTENTIKASI =================
 class AuthPayload(BaseModel):
     username: str
     password: str
@@ -177,7 +176,6 @@ class AuthPayload(BaseModel):
 
 @router.get("/api/check-user-status/{username}")
 def check_user_status(username: str, db: Session = Depends(get_db)):
-    """Memeriksa apakah akun sudah terdaftar dan status approval-nya untuk animasi gembok."""
     uname = username.strip().lower()
     u = db.query(User).filter(User.username == uname).first()
     if not u:
@@ -196,11 +194,10 @@ def login(payload: AuthPayload, request: Request, db: Session = Depends(get_db))
     if not u:
         raise HTTPException(status_code=401, detail="Username atau password salah!")
 
-    # Cek status approval
     if u.role != "admin" and (u.status_approval or "").upper() == "PENDING":
         raise HTTPException(
             status_code=403, 
-            detail="Akun Anda sedang menunggu persetujuan Admin Toko Rina. Hubungi admin untuk aktivasi!"
+            detail="Akun Anda sedang menunggu persetujuan Admin Toko Rina."
         )
     if u.role != "admin" and (u.status_approval or "").upper() == "REJECTED":
         raise HTTPException(
@@ -261,7 +258,7 @@ def register_kasir(payload: AuthPayload, request: Request, db: Session = Depends
         username=uname, 
         password_hash=pwd, 
         role="kasir",
-        status_approval="PENDING",  # WAJIB MENUNGGU PERSETUJUAN ADMIN
+        status_approval="PENDING",
         registered_ip=client_ip,
         registered_location=client_loc,
         latitude=lat,
@@ -289,10 +286,9 @@ def register_kasir(payload: AuthPayload, request: Request, db: Session = Depends
     }
 
 
-# ================= MANAJEMEN USER & APPROVAL (ADMIN ONLY) =================
+# ================= MANAJEMEN USER (ADMIN ONLY) =================
 @router.get("/api/admin/users")
 def get_user_list(db: Session = Depends(get_db)):
-    """Mengambil daftar seluruh pengguna, IP, lokasi, koordinat GPS, status approval, dan hak akses."""
     users = db.query(User).order_by(User.id.desc()).all()
     pending_count = db.query(User).filter(User.status_approval == "PENDING").count()
     out = []
@@ -322,17 +318,16 @@ def get_user_list(db: Session = Depends(get_db)):
 
 class UserApprovalPayload(BaseModel):
     user_id: int
-    status: str  # 'APPROVED' atau 'REJECTED'
+    status: str
     username_admin: str = "admin"
 
 
 @router.put("/api/admin/users/approval")
 def set_user_approval(payload: UserApprovalPayload, request: Request, db: Session = Depends(get_db)):
-    """Menyetujui atau menolak akun kasir baru."""
     target_user = db.query(User).filter(User.id == payload.user_id).first()
     if not target_user:
         raise HTTPException(status_code=404, detail="Pengguna tidak ditemukan")
-    if target_user.role == "admin":
+    if target_user.role == "admin" and target_user.username == "admin":
         raise HTTPException(status_code=400, detail="Akun Admin utama tidak dapat diubah statusnya")
 
     target_user.status_approval = payload.status.upper()
@@ -360,11 +355,10 @@ class UserPermissionPayload(BaseModel):
 
 @router.put("/api/admin/users/permissions")
 def update_user_permissions(payload: UserPermissionPayload, request: Request, db: Session = Depends(get_db)):
-    """Mengubah hak akses tab mana saja yang boleh dilihat/digunakan pengguna."""
     target_user = db.query(User).filter(User.id == payload.user_id).first()
     if not target_user:
         raise HTTPException(status_code=404, detail="Pengguna tidak ditemukan")
-    if target_user.role == "admin":
+    if target_user.role == "admin" and target_user.username == "admin":
         raise HTTPException(status_code=400, detail="Hak akses akun Admin utama tidak dapat dibatasi")
 
     target_user.allowed_tabs = json.dumps(payload.allowed_tabs)
@@ -380,6 +374,73 @@ def update_user_permissions(payload: UserPermissionPayload, request: Request, db
     ))
     db.commit()
     return {"status": "SUCCESS", "message": f"Izin akses untuk {target_user.username} berhasil disimpan"}
+
+
+class EditUserPayload(BaseModel):
+    user_id: int
+    username: str
+    role: str
+    status_approval: str
+    new_password: Optional[str] = None
+    admin_operator: str = "admin"
+
+
+@router.put("/api/admin/users/edit")
+def edit_user_profile(payload: EditUserPayload, request: Request, db: Session = Depends(get_db)):
+    u = db.query(User).filter(User.id == payload.user_id).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="User tidak ditemukan")
+    if u.username == "admin" and payload.username.lower() != "admin":
+        raise HTTPException(status_code=400, detail="Username akun admin utama tidak boleh diubah!")
+
+    if payload.username.lower() != u.username:
+        dup = db.query(User).filter(User.username == payload.username.lower()).first()
+        if dup:
+            raise HTTPException(status_code=400, detail="Username tersebut sudah dipakai!")
+
+    old_uname = u.username
+    u.username = payload.username.lower().strip()
+    u.role = payload.role.lower().strip()
+    u.status_approval = payload.status_approval.upper().strip()
+    if payload.new_password and len(payload.new_password.strip()) >= 4:
+        u.password_hash = payload.new_password.strip()
+
+    client_ip, client_loc, lat, lon = detect_client_info(request)
+    db.add(AuditActionLog(
+        username=payload.admin_operator,
+        action_type="USER_EDIT",
+        description=f"Admin mengubah profil user '{old_uname}' -> '{u.username}', Role: {u.role}, Status: {u.status_approval}",
+        client_ip=client_ip,
+        client_location=client_loc,
+        latitude=lat,
+        longitude=lon
+    ))
+    db.commit()
+    return {"status": "SUCCESS", "message": f"Data user {u.username} berhasil diperbarui!"}
+
+
+@router.delete("/api/admin/users/{user_id}")
+def delete_user(user_id: int, request: Request, admin_operator: str = "admin", db: Session = Depends(get_db)):
+    u = db.query(User).filter(User.id == user_id).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="User tidak ditemukan")
+    if u.username == "admin":
+        raise HTTPException(status_code=400, detail="Akun admin utama tidak boleh dihapus!")
+
+    uname = u.username
+    db.delete(u)
+    client_ip, client_loc, lat, lon = detect_client_info(request)
+    db.add(AuditActionLog(
+        username=admin_operator,
+        action_type="USER_DELETE",
+        description=f"Admin menghapus akun user '{uname}'",
+        client_ip=client_ip,
+        client_location=client_loc,
+        latitude=lat,
+        longitude=lon
+    ))
+    db.commit()
+    return {"status": "SUCCESS", "message": f"Akun {uname} berhasil dihapus permanen!"}
 
 
 # ================= DASHBOARD SUMMARY =================
@@ -421,10 +482,21 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
                 total_kumulatif_net_tf += (cr - db_exp)
 
                 if not unmatched_mutations:
-                    unmatched_mutations = [
-                        {**r, "id": idx} for idx, r in enumerate(records)
-                        if r.get("status_matching") == "UNMATCHED" and r.get("tipe") == "CR"
-                    ]
+                    for idx, r in enumerate(records):
+                        if r.get("tipe") == "CR":
+                            nom_asli = float(r.get("original_nominal") if "original_nominal" in r else r.get("nominal", 0.0))
+                            nom_aktif = float(r.get("sisa_nominal") if "sisa_nominal" in r else nom_asli)
+                            is_unmatched = r.get("status_matching") == "UNMATCHED"
+                            has_leftover = nom_aktif > 1.0 and (nom_aktif < nom_asli or r.get("has_leftover", False))
+
+                            if is_unmatched or has_leftover:
+                                unmatched_mutations.append({
+                                    **r,
+                                    "id": idx,
+                                    "nominal": nom_aktif,
+                                    "original_nominal": nom_asli,
+                                    "is_leftover": has_leftover
+                                })
                     latest_db_items = [r for r in records if r.get("tipe") == "DB"]
             except Exception:
                 pass
@@ -454,6 +526,42 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
     }
 
 
+# ================= HELPER SINKRONISASI LAPORAN KE PERPUSTAKAAN =================
+def sync_audit_report_to_library(audit_date: str, db: Session, html_content: Optional[str] = None) -> None:
+    if not html_content:
+        resp = generate_daily_audit_report(audit_date, db, auto_sync=False)
+        html_content = resp.body.decode("utf-8")
+
+    filename = f"Laporan_Audit_{audit_date}.html"
+    file_path = DOCS_DIR / filename
+    file_path.write_text(html_content, encoding="utf-8")
+    size_kb = round(len(html_content.encode("utf-8")) / 1024, 1)
+
+    doc = db.query(UploadedDocument).filter(
+        UploadedDocument.doc_date == audit_date,
+        UploadedDocument.filename == filename
+    ).first()
+
+    if not doc:
+        new_doc = UploadedDocument(
+            filename=filename,
+            file_path=str(file_path),
+            file_type="HTML",
+            file_size_kb=size_kb,
+            extra_info="Rekap Audit Resmi",
+            doc_date=audit_date,
+            upload_time=datetime.now().strftime("%H:%M"),
+            status="Terproses"
+        )
+        db.add(new_doc)
+    else:
+        doc.file_size_kb = size_kb
+        doc.upload_time = datetime.now().strftime("%H:%M")
+        doc.status = "Terproses"
+    
+    db.commit()
+
+
 # ================= RUN AUDIT =================
 @router.post("/api/run-audit")
 async def run_audit(
@@ -464,6 +572,8 @@ async def run_audit(
     laci_items_json: str = Form(...),
     brankas_items_json: str = Form(...),
     cash_adjustment: float = Form(0.0),
+    cash_debt_receivable_ids_json: Optional[str] = Form("[]"),
+    cash_adjustment_note: Optional[str] = Form(""),
     override_existing: bool = Form(False),
     username: str = Form(...),
     db: Session = Depends(get_db)
@@ -499,23 +609,61 @@ async def run_audit(
             vault_items=brankas_items,
             input_by=username
         )
+        
+        pdf_summary_file = target_archive_dir / "penjualan_pos_pdf.json"
+        pdf_summary_data = {
+            "total_cash": float(pdf_data.get("total_cash", 0.0)),
+            "total_debit": float(pdf_data.get("total_debit", 0.0)),
+            "total_credit": float(pdf_data.get("total_credit", 0.0)),
+            "records": today_sales
+        }
+        pdf_summary_file.write_text(json.dumps(pdf_summary_data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        selected_cash_debt_ids = []
+        try:
+            selected_cash_debt_ids = json.loads(cash_debt_receivable_ids_json or "[]")
+        except Exception:
+            pass
+
+        adj_file = target_archive_dir / "penyesuaian_kas.json"
+        adj_data = {
+            "nominal": cash_adjustment,
+            "keterangan": cash_adjustment_note or "-",
+            "receivable_ids_settled": selected_cash_debt_ids,
+            "tanggal": audit_date
+        }
+        adj_file.write_text(json.dumps(adj_data, indent=2, ensure_ascii=False), encoding="utf-8")
 
         record_daily_credit_sales(db, audit_date, today_sales)
-        db.flush()
+        db.commit()
+
+        affected_dates = set()
+        if selected_cash_debt_ids:
+            for debt_id in selected_cash_debt_ids:
+                recv_obj = db.query(Receivable).filter(Receivable.id == debt_id).first()
+                if recv_obj:
+                    if recv_obj.sale_date != audit_date:
+                        affected_dates.add(recv_obj.sale_date)
+                    settle_receivable(db, debt_id, float(recv_obj.remaining_amount), audit_date)
+            db.commit()
 
         reconcile_res = reconcile_daily_bank_mutations(db, audit_date, bank_mutations, today_sales)
-        db.flush()
+        db.commit()
 
+        # 1. Total Uang Fisik Nyata Murni (Laci + Brankas)
         total_laci = sum(float(i.get("qty", 1.0)) * float(i.get("unit_price", 0.0)) for i in laci_items)
         total_brankas_out = sum(float(i.get("qty", 1.0)) * float(i.get("unit_price", 0.0)) for i in brankas_items)
-        total_cash_fisik_harian = total_laci + vault_in + cash_adjustment
+        total_cash_fisik_murni = total_laci + vault_in
         total_cash_pdf = float(pdf_data.get("total_cash", 0.0))
 
-        discrepancy = total_cash_fisik_harian - total_cash_pdf
+        # 2. Perhitungan Selisih Awal Kas dan Sisa Selisih Bersih
+        raw_discrepancy = total_cash_fisik_murni - total_cash_pdf
+        net_remaining_discrepancy = raw_discrepancy - cash_adjustment
 
+        # 3. Evaluasi ML Menggunakan Sisa Selisih Bersih yang Sebenarnya
         cfg = db.query(MLSetting).first() or MLSetting()
         audit_eval = evaluate_daily_audit_risks(
-            current_discrepancy=discrepancy,
+            current_discrepancy=net_remaining_discrepancy,
             vault_expense=total_brankas_out,
             unmatched_transfers=reconcile_res.get("unmatched_transfers_list", []),
             daily_transactions=today_sales,
@@ -528,21 +676,24 @@ async def run_audit(
         db.add(AuditActionLog(
             username=username,
             action_type="AUDIT_RUN",
-            description=f"Audit {audit_date}: Brankas Masuk=Rp {vault_in:,.0f}, Tunai PDF=Rp {total_cash_pdf:,.0f}, Selisih Kas=Rp {discrepancy:,.0f}",
+            description=f"Audit {audit_date}: Brankas=Rp {vault_in:,.0f}, Tunai PDF=Rp {total_cash_pdf:,.0f}, Selisih Awal=Rp {raw_discrepancy:,.0f}, Sisa Selisih=Rp {net_remaining_discrepancy:,.0f}",
             client_ip=client_ip,
             client_location=client_loc,
             latitude=lat,
             longitude=lon
         ))
-
         db.commit()
+
+        sync_audit_report_to_library(audit_date, db)
+        for aff_date in affected_dates:
+            sync_audit_report_to_library(aff_date, db)
 
         return {
             "status": "SUCCESS",
             "audit_date": audit_date,
-            "cash_collected": total_cash_fisik_harian,
+            "cash_collected": total_cash_fisik_murni,
             "system_cash_pdf": total_cash_pdf,
-            "discrepancy": discrepancy,
+            "discrepancy": net_remaining_discrepancy,
             "ml_evaluation": audit_eval,
             "unmatched_list": reconcile_res.get("unmatched_transfers_list", [])
         }
@@ -552,6 +703,494 @@ async def run_audit(
     except Exception as exc:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Gagal memproses audit: {str(exc)}")
+
+
+# ================= GENERATOR LAPORAN AUDIT HARIAN =================
+@router.get("/api/reports/daily-audit/{audit_date}", response_class=HTMLResponse)
+def generate_daily_audit_report(audit_date: str, db: Session = Depends(get_db), auto_sync: bool = True):
+    raw_folder = Path("data/raw") / audit_date
+
+    # 1. Ringkasan Penjualan POS PDF
+    cash_laporan_pdf = 0.0
+    debit_laporan_pdf = 0.0
+    kredit_laporan_pdf = 0.0
+
+    pdf_sum_file = raw_folder / "penjualan_pos_pdf.json"
+    if pdf_sum_file.exists():
+        try:
+            p_data = json.loads(pdf_sum_file.read_text(encoding="utf-8"))
+            cash_laporan_pdf = float(p_data.get("total_cash", 0.0))
+            debit_laporan_pdf = float(p_data.get("total_debit", 0.0))
+            kredit_laporan_pdf = float(p_data.get("total_credit", 0.0))
+        except Exception:
+            pass
+
+    # 2. Rekap Kas Fisik Murni (Brankas + Laci)
+    vault_in = 0.0
+    laci_items = []
+    vm_file = raw_folder / "uang_masuk_brankas.json"
+    if vm_file.exists():
+        try:
+            d = json.loads(vm_file.read_text(encoding="utf-8"))
+            vault_in = float(d.get("nominal") or d.get("uang_masuk_brankas") or 0.0)
+        except Exception:
+            pass
+
+    laci_file = raw_folder / "uang_keluar_laci.json"
+    if laci_file.exists():
+        try:
+            d = json.loads(laci_file.read_text(encoding="utf-8"))
+            laci_items = d.get("items", [])
+        except Exception:
+            pass
+
+    total_keluar_laci = sum(float(i.get("qty", 1.0)) * float(i.get("unit_price", 0.0)) for i in laci_items)
+    total_rekap_cash = vault_in + total_keluar_laci
+
+    penyesuaian_kas = 0.0
+    penyesuaian_ket = ""
+    adj_file = raw_folder / "penyesuaian_kas.json"
+    if adj_file.exists():
+        try:
+            d = json.loads(adj_file.read_text(encoding="utf-8"))
+            penyesuaian_kas = float(d.get("nominal", 0.0))
+            penyesuaian_ket = d.get("keterangan", "")
+        except Exception:
+            pass
+
+    selisih = total_rekap_cash - cash_laporan_pdf
+    sisa_selisih = selisih - penyesuaian_kas
+
+    # 3. Baca Mutasi Bank & Hitung Total Debit Mutasi (Semua CR Bank)
+    debit_matches = []
+    kredit_matches = []
+    utang_tersimpan_matches = []
+    total_debit_mutasi_cr = 0.0
+
+    mb_file = raw_folder / "mutasi_db_bank.json"
+    if mb_file.exists():
+        try:
+            mb_data = json.loads(mb_file.read_text(encoding="utf-8"))
+            for r in mb_data.get("records", []):
+                nom_asli = float(r.get("nominal", 0.0))
+                nom_terpakai = float(r.get("used_nominal") if "used_nominal" in r else nom_asli)
+                desc = r.get("keterangan", "-")
+                matched_with = str(r.get("matched_with", "-") or "-")
+                status_m = (r.get("status_matching") or "").upper()
+                tipe_m = (r.get("tipe") or "CR").upper()
+
+                if tipe_m == "CR":
+                    total_debit_mutasi_cr += nom_asli
+
+                sender_name = desc.split("WS95011")[-1].strip() if "WS95011" in desc else desc
+                sender_name = sender_name.replace("TRSF E-BANKING CR", "").replace("0510/FTSCY/WS95271", "").replace("0510/FTSCY/WS95031", "").strip()[:24]
+
+                is_today_debt = False
+                if "BON PDF HARI INI" in matched_with.upper():
+                    is_today_debt = True
+
+                settled_details = r.get("settled_details", [])
+                if settled_details:
+                    all_today = all(item.get("sale_date") == audit_date for item in settled_details)
+                    if all_today:
+                        is_today_debt = True
+
+                if status_m in ["MATCHED_SALES_DEBIT", "K_DEBIT_MATCH"]:
+                    debit_matches.append({"nominal": nom_terpakai, "sender": sender_name or "Konsumen", "target": matched_with})
+                elif status_m in ["MATCHED_TODAY_CREDIT", "TODAY_CREDIT_SETTLED"] or is_today_debt:
+                    debit_target_desc = matched_with
+                    if settled_details:
+                        detail_strs = [f"{d['customer_code']}({d['allocated_amount']:,.0f})" for d in settled_details]
+                        debit_target_desc = f"manual({', '.join(detail_strs)})"
+                    kredit_matches.append({"nominal": nom_terpakai, "sender": sender_name or "Konsumen", "target": debit_target_desc})
+                elif status_m in ["MATCHED_DEBT_SETTLED", "OLD_DEBT_SETTLED", "MATCHED_MANUAL"]:
+                    if is_today_debt:
+                        continue
+
+                    target_info = matched_with
+                    if settled_details:
+                        detail_strs = []
+                        for d in settled_details:
+                            status_label = "Lunas" if d.get("is_lunas") else f"Sebagian, Sisa: Rp {d.get('remaining', 0):,.0f}"
+                            detail_strs.append(f"{d['customer_code']} (Nota tgl {d['sale_date']} - {status_label})")
+                        target_info = f"manual({', '.join(detail_strs)})"
+
+                    utang_tersimpan_matches.append({"nominal": nom_terpakai, "sender": sender_name or "Konsumen", "target": target_info})
+        except Exception:
+            pass
+
+    total_debit_mutasi_match = sum(m["nominal"] for m in debit_matches)
+    total_kredit_mutasi_match = sum(m["nominal"] for m in kredit_matches)
+    total_utang_tersimpan_match = sum(m["nominal"] for m in utang_tersimpan_matches)
+
+    total_semua_mutasi_match = total_debit_mutasi_match + total_kredit_mutasi_match + total_utang_tersimpan_match
+    selisih_debit_mutasi = total_semua_mutasi_match - total_debit_mutasi_cr
+
+    # 4. Pelanggan Utang Hari Ini
+    receivables_today = (
+        db.query(Receivable, Customer)
+        .join(Customer, Receivable.customer_id == Customer.id)
+        .filter(Receivable.sale_date == audit_date)
+        .all()
+    )
+
+    today_debts_display = []
+    total_utang_keseluruhan = 0.0
+    total_pembayaran_utang = 0.0
+    total_active_today_debt = 0.0
+
+    for recv, cust in receivables_today:
+        code = cust.customer_code
+        rem = float(recv.remaining_amount)
+        init_amt = float(recv.initial_amount)
+        total_utang_keseluruhan += init_amt
+
+        if recv.status == "LUNAS":
+            paid_info = f" (Lunas tgl {recv.paid_date})" if recv.paid_date else " (LUNAS)"
+            today_debts_display.append({
+                "label": f"{code}{paid_info}",
+                "amount": init_amt,
+                "is_settled": True
+            })
+            total_pembayaran_utang += init_amt
+        elif recv.status == "SEBAGIAN" or (rem < init_amt and rem > 0):
+            paid_part = init_amt - rem
+            total_pembayaran_utang += paid_part
+            today_debts_display.append({
+                "label": f"{code} (Bayar Sebagian Rp {paid_part:,.0f})",
+                "amount": rem,
+                "is_settled": False
+            })
+            total_active_today_debt += rem
+        else:
+            today_debts_display.append({
+                "label": code,
+                "amount": rem,
+                "is_settled": False
+            })
+            total_active_today_debt += rem
+
+    try:
+        dt = datetime.strptime(audit_date, "%Y-%m-%d")
+        indo_days = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+        indo_months = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+        formatted_date = f"{indo_days[dt.weekday()]}, {dt.day:02d} {indo_months[dt.month - 1]} {dt.year}"
+    except Exception:
+        formatted_date = audit_date
+
+    laci_rows_html = ""
+    for it in laci_items:
+        nm = it.get("item_name", "Operasional")
+        pr = float(it.get("unit_price", 0.0)) * float(it.get("qty", 1.0))
+        laci_rows_html += f"""
+        <tr>
+          <td class="indent">- {nm}</td>
+          <td class="text-right">Rp {pr:,.0f}</td>
+        </tr>
+        """
+
+    debit_rows_html = ""
+    for d in debit_matches:
+        debit_rows_html += f"""
+        <tr>
+          <td>Rp {d['nominal']:,.0f} ({d['sender']})</td>
+          <td class="text-right">&rarr; {d['target']}</td>
+        </tr>
+        """
+    if not debit_matches:
+        debit_rows_html = "<tr><td colspan='2' class='text-slate-400'>- Tidak ada mutasi debit -</td></tr>"
+
+    kredit_rows_html = ""
+    for k in kredit_matches:
+        kredit_rows_html += f"""
+        <tr>
+          <td>Rp {k['nominal']:,.0f} ({k['sender']})</td>
+          <td class="text-right">&rarr; {k['target']}</td>
+        </tr>
+        """
+    if not kredit_matches:
+        kredit_rows_html = "<tr><td colspan='2' class='text-slate-400'>- Tidak ada mutasi kredit -</td></tr>"
+
+    utang_tersimpan_html = ""
+    for u in utang_tersimpan_matches:
+        utang_tersimpan_html += f"""
+        <tr>
+          <td>Rp {u['nominal']:,.0f} ({u['sender']})</td>
+          <td class="text-right">&rarr; {u['target']}</td>
+        </tr>
+        """
+    if not utang_tersimpan_matches:
+        utang_tersimpan_html = "<tr><td colspan='2' class='text-slate-400'>- Nihil -</td></tr>"
+
+    debts_rows_html = ""
+    for db_row in today_debts_display:
+        st_style = "text-decoration: line-through; color: #16a34a;" if db_row["is_settled"] else ""
+        debts_rows_html += f"""
+        <tr>
+          <td style="{st_style}">{db_row['label']}</td>
+          <td class="text-right" style="{st_style}">Rp {db_row['amount']:,.0f}</td>
+        </tr>
+        """
+    if not today_debts_display:
+        debts_rows_html = "<tr><td colspan='2' class='text-slate-400'>- Nihil -</td></tr>"
+
+    if selisih > 0:
+        selisih_html = f"+Rp {selisih:,.0f} (lebih)"
+        selisih_color = "#0b7285"
+    elif selisih < 0:
+        selisih_html = f"-Rp {abs(selisih):,.0f} (kurang)"
+        selisih_color = "#e11d48"
+    else:
+        selisih_html = "Rp 0 (Pas / Balance)"
+        selisih_color = "#16a34a"
+
+    if sisa_selisih > 0:
+        sisa_selisih_html = f"+Rp {sisa_selisih:,.0f} (lebih)"
+        sisa_color = "#0b7285"
+    elif sisa_selisih < 0:
+        sisa_selisih_html = f"-Rp {abs(sisa_selisih):,.0f} (kurang)"
+        sisa_color = "#e11d48"
+    else:
+        sisa_selisih_html = "Rp 0 (Pas / Selesai)"
+        sisa_color = "#16a34a"
+
+    if selisih_debit_mutasi < 0:
+        status_debit_mutasi_html = f"-Rp {abs(selisih_debit_mutasi):,.0f} (kurang debit)"
+        status_debit_color = "#e11d48"
+    elif selisih_debit_mutasi > 0:
+        status_debit_mutasi_html = f"+Rp {selisih_debit_mutasi:,.0f} (lebih debit)"
+        status_debit_color = "#0b7285"
+    else:
+        status_debit_mutasi_html = "Rp 0 (Sesuai / Balance)"
+        status_debit_color = "#16a34a"
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <title>Laporan Audit Harian - {audit_date}</title>
+  <style>
+    @page {{ size: A4 portrait; margin: 15mm; }}
+    body {{
+      font-family: Arial, Helvetica, sans-serif;
+      color: #1a1a1a;
+      background-color: #ffffff;
+      margin: 0;
+      padding: 20px;
+      font-size: 13px;
+      line-height: 1.5;
+    }}
+    .container {{
+      max-width: 650px;
+      margin: 0 auto;
+      border: 1px solid #ddd;
+      padding: 24px;
+      border-radius: 8px;
+    }}
+    .header {{
+      text-align: center;
+      border-bottom: 2px solid #222;
+      padding-bottom: 12px;
+      margin-bottom: 18px;
+    }}
+    .header h1 {{ margin: 0; font-size: 20px; letter-spacing: 1px; text-transform: uppercase; }}
+    .header p {{ margin: 4px 0 0; color: #555; font-size: 13px; font-weight: bold; }}
+    .section-title {{
+      font-weight: bold;
+      text-transform: uppercase;
+      font-size: 12px;
+      letter-spacing: 0.5px;
+      color: #333;
+      border-bottom: 1px solid #ccc;
+      padding-bottom: 4px;
+      margin-top: 18px;
+      margin-bottom: 8px;
+    }}
+    table {{ width: 100%; border-collapse: collapse; margin-bottom: 6px; }}
+    td {{ padding: 4px 0; vertical-align: top; }}
+    .text-right {{ text-align: right; }}
+    .font-bold {{ font-weight: bold; }}
+    .indent {{ padding-left: 16px; }}
+    .subtotal-line {{ border-top: 1px dashed #aaa; }}
+    .total-line {{ border-top: 1px solid #222; border-bottom: 2px double #222; }}
+    .box-summary {{
+      background-color: #f8f9fa;
+      border: 1px solid #e9ecef;
+      border-radius: 6px;
+      padding: 10px 14px;
+      margin-top: 14px;
+    }}
+    .footer-note {{
+      text-align: center;
+      margin-top: 20px;
+      font-size: 11px;
+      color: #777;
+      font-style: italic;
+    }}
+    .print-bar {{
+      max-width: 650px;
+      margin: 0 auto 12px auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }}
+    .btn-print {{
+      background: #4f46e5;
+      color: #fff;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-weight: bold;
+      cursor: pointer;
+    }}
+    @media print {{
+      .print-bar {{ display: none; }}
+      body {{ padding: 0; }}
+      .container {{ border: none; padding: 0; }}
+    }}
+  </style>
+</head>
+<body>
+
+<div class="print-bar">
+  <span style="font-weight: bold; color: #4338ca;">Toko Rina Reconciliation System</span>
+  <button class="btn-print" onclick="window.print()">🖨️ Cetak / Unduh PDF</button>
+</div>
+
+<div class="container">
+  <div class="header">
+    <h1>Laporan Audit Harian</h1>
+    <p>{formatted_date}</p>
+  </div>
+
+  <table>
+    <tr>
+      <td class="font-bold">CASH LAPORAN</td>
+      <td class="text-right">Rp {cash_laporan_pdf:,.0f}</td>
+    </tr>
+    <tr>
+      <td class="font-bold">DEBIT LAPORAN</td>
+      <td class="text-right">Rp {debit_laporan_pdf:,.0f}</td>
+    </tr>
+    <tr>
+      <td class="font-bold">DEBIT MUTASI</td>
+      <td class="text-right">Rp {total_debit_mutasi_cr:,.0f}</td>
+    </tr>
+  </table>
+
+  <div class="section-title">Mutasi Match Penjualan Hari Ini</div>
+  <div style="font-weight: bold; font-size: 12px; margin: 4px 0;">[DEBIT]</div>
+  <table>
+    {debit_rows_html}
+    <tr class="subtotal-line font-bold">
+      <td>Total Debit Match</td>
+      <td class="text-right">Rp {total_debit_mutasi_match:,.0f}</td>
+    </tr>
+  </table>
+
+  <div style="font-weight: bold; font-size: 12px; margin: 8px 0 4px;">[KREDIT]</div>
+  <table>
+    {kredit_rows_html}
+    <tr class="subtotal-line font-bold">
+      <td>Total Kredit Match</td>
+      <td class="text-right">Rp {total_kredit_mutasi_match:,.0f}</td>
+    </tr>
+  </table>
+
+  <div class="section-title">Mutasi Match Utang Tersimpan</div>
+  <table>
+    {utang_tersimpan_html}
+    <tr class="subtotal-line font-bold">
+      <td>Total</td>
+      <td class="text-right">Rp {total_utang_tersimpan_match:,.0f}</td>
+    </tr>
+  </table>
+
+  <div class="section-title">Pelanggan Utang Hari Ini</div>
+  <table>
+    {debts_rows_html}
+    <tr class="subtotal-line font-bold" style="border-top: 1px solid #aaa;">
+      <td>Total Utang Hari Ini</td>
+      <td class="text-right">Rp {total_utang_keseluruhan:,.0f}</td>
+    </tr>
+    <tr class="font-bold" style="color: #16a34a;">
+      <td>Pembayaran Dilunasi</td>
+      <td class="text-right">-Rp {total_pembayaran_utang:,.0f}</td>
+    </tr>
+    <tr class="total-line font-bold" style="color: #d97706;">
+      <td>Utang Aktif Tersisa</td>
+      <td class="text-right">Rp {total_active_today_debt:,.0f}</td>
+    </tr>
+  </table>
+
+  <div class="section-title">Rekap Cash Fisik</div>
+  <table>
+    <tr>
+      <td>Masuk brankas</td>
+      <td class="text-right">Rp {vault_in:,.0f}</td>
+    </tr>
+    <tr>
+      <td colspan="2">Keluar laci:</td>
+    </tr>
+    {laci_rows_html}
+    <tr class="subtotal-line">
+      <td class="indent font-bold">Subtotal keluar laci</td>
+      <td class="text-right font-bold">Rp {total_keluar_laci:,.0f}</td>
+    </tr>
+    <tr class="total-line font-bold">
+      <td>TOTAL REKAP CASH</td>
+      <td class="text-right">Rp {total_rekap_cash:,.0f}</td>
+    </tr>
+  </table>
+
+  <div class="box-summary">
+    <table>
+      <tr>
+        <td style="width: 44%;">Cash penjualan PDF</td>
+        <td style="width: 4%;">:</td>
+        <td class="font-bold">Rp {cash_laporan_pdf:,.0f}</td>
+      </tr>
+      <tr>
+        <td>Total rekap cash</td>
+        <td>:</td>
+        <td class="font-bold">Rp {total_rekap_cash:,.0f}</td>
+      </tr>
+      <tr>
+        <td>Selisih</td>
+        <td>:</td>
+        <td class="font-bold" style="color: {selisih_color};">{selisih_html}</td>
+      </tr>
+      <tr>
+        <td>Keterangan</td>
+        <td>:</td>
+        <td>{penyesuaian_ket or '-'}</td>
+      </tr>
+      <tr style="border-top: 1px dashed #ccc;">
+        <td>Sisa selisih</td>
+        <td>:</td>
+        <td class="font-bold" style="color: {sisa_color};">{sisa_selisih_html}</td>
+      </tr>
+      <tr style="border-top: 1px dashed #ccc;">
+        <td>Status mutasi debit</td>
+        <td>:</td>
+        <td class="font-bold" style="color: {status_debit_color};">{status_debit_mutasi_html}</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="footer-note">Dicetak otomatis dari Sistem Audit POS Toko Rina v2.0</div>
+</div>
+
+</body>
+</html>"""
+    
+    if auto_sync:
+        try:
+            sync_audit_report_to_library(audit_date, db, html_content)
+        except Exception:
+            pass
+
+    return HTMLResponse(content=html_content)
 
 
 # ================= PERPUSTAKAAN DOKUMEN =================
@@ -580,7 +1219,7 @@ async def upload_document(
     db: Session = Depends(get_db)
 ):
     ext = file.filename.split(".")[-1].upper() if "." in file.filename else "FILE"
-    ftype = "PDF" if ext == "PDF" else ("CSV" if ext == "CSV" else ("IMG" if ext in ["JPG", "JPEG", "PNG"] else "OTHER"))
+    ftype = "PDF" if ext == "PDF" else ("CSV" if ext == "CSV" else ("HTML" if ext in ["HTML", "HTM"] else "OTHER"))
 
     safe_name = f"{doc_date}_{int(datetime.utcnow().timestamp())}_{file.filename}"
     saved_path = DOCS_DIR / safe_name
@@ -588,7 +1227,7 @@ async def upload_document(
     saved_path.write_bytes(content)
 
     size_kb = round(len(content) / 1024, 1)
-    extra = "1 halaman" if ftype == "PDF" else ("File Data" if ftype == "CSV" else "Lampiran berkas")
+    extra = "1 halaman" if ftype == "PDF" else ("File Data" if ftype == "CSV" else "Laporan Audit Resmi")
 
     new_doc = UploadedDocument(
         filename=file.filename,
@@ -605,6 +1244,46 @@ async def upload_document(
     return {"status": "SUCCESS", "message": "Dokumen berhasil disimpan ke perpustakaan"}
 
 
+class EditDocumentPayload(BaseModel):
+    doc_id: int
+    doc_date: str
+    extra_info: Optional[str] = "-"
+    status: Optional[str] = "Belum Diproses"
+
+
+@router.put("/api/documents/edit")
+def edit_document(payload: EditDocumentPayload, db: Session = Depends(get_db)):
+    doc = db.query(UploadedDocument).filter(UploadedDocument.id == payload.doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
+
+    doc.doc_date = payload.doc_date
+    if payload.extra_info:
+        doc.extra_info = payload.extra_info
+    if payload.status:
+        doc.status = payload.status
+    db.commit()
+    return {"status": "SUCCESS", "message": "Data dokumen berhasil diperbarui!"}
+
+
+@router.delete("/api/documents/{doc_id}")
+def delete_document(doc_id: int, db: Session = Depends(get_db)):
+    doc = db.query(UploadedDocument).filter(UploadedDocument.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
+
+    try:
+        p = Path(doc.file_path)
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+    db.delete(doc)
+    db.commit()
+    return {"status": "SUCCESS", "message": f"Dokumen '{doc.filename}' berhasil dihapus!"}
+
+
 @router.get("/api/documents/{doc_id}/download")
 def download_document(doc_id: int, db: Session = Depends(get_db)):
     doc = db.query(UploadedDocument).filter(UploadedDocument.id == doc_id).first()
@@ -614,7 +1293,19 @@ def download_document(doc_id: int, db: Session = Depends(get_db)):
     doc.status = "Terproses"
     db.commit()
 
-    return FileResponse(path=doc.file_path, filename=doc.filename, media_type="application/octet-stream")
+    if (doc.file_type or "").upper() == "HTML":
+        return FileResponse(
+            path=doc.file_path, 
+            filename=doc.filename, 
+            media_type="text/html; charset=utf-8",
+            content_disposition_type="inline"
+        )
+
+    return FileResponse(
+        path=doc.file_path, 
+        filename=doc.filename, 
+        media_type="application/octet-stream"
+    )
 
 
 class StatusTogglePayload(BaseModel):
@@ -701,11 +1392,11 @@ def update_ml_settings(payload: MLSettingPayload, request: Request, db: Session 
     return {"status": "SUCCESS", "message": "Konfigurasi ML berhasil diperbarui"}
 
 
-# ================= REKONSILIASI MANUAL =================
+# ================= REKONSILIASI MANUAL DENGAN ALOKASI SISA =================
 class BatchManualMatchPayload(BaseModel):
     audit_date: str
     selected_mutation_indices: List[int]
-    target_receivable_id: Optional[int] = None
+    target_receivable_ids: Optional[List[int]] = None
     target_customer_code: Optional[str] = None
     note: str
     username: str
@@ -721,16 +1412,71 @@ def batch_manual_match(payload: BatchManualMatchPayload, request: Request, db: S
     data = json.loads(mb_file.read_text(encoding="utf-8"))
     records = data.get("records", [])
 
-    matched_nominal_total = 0.0
+    total_pool_available = 0.0
     for idx in payload.selected_mutation_indices:
         if 0 <= idx < len(records):
-            records[idx]["status_matching"] = "MATCHED_MANUAL"
-            records[idx]["catatan_admin"] = payload.note
-            records[idx]["matched_with"] = payload.target_customer_code or f"BON-{payload.target_receivable_id}"
-            matched_nominal_total += float(records[idx].get("nominal", 0.0))
+            r = records[idx]
+            nom = float(r.get("sisa_nominal") if "sisa_nominal" in r else r.get("nominal", 0.0))
+            total_pool_available += nom
 
-    if payload.target_receivable_id:
-        settle_receivable(db, payload.target_receivable_id, matched_nominal_total, payload.audit_date)
+    affected_dates = set()
+    settled_details = []
+    remaining_pool = total_pool_available
+
+    if payload.target_receivable_ids:
+        for debt_id in payload.target_receivable_ids:
+            recv = db.query(Receivable).filter(Receivable.id == debt_id).first()
+            if recv and remaining_pool > 0:
+                affected_dates.add(recv.sale_date)
+                c_code = recv.customer.customer_code if recv.customer else f"BON-{recv.id}"
+                pay_amt = min(remaining_pool, float(recv.remaining_amount))
+                settle_receivable(db, debt_id, pay_amt, payload.audit_date)
+                
+                db.flush()
+                is_lunas = (recv.status == "LUNAS")
+                rem_after = float(recv.remaining_amount)
+
+                settled_details.append({
+                    "receivable_id": debt_id,
+                    "customer_code": c_code,
+                    "sale_date": recv.sale_date,
+                    "allocated_amount": pay_amt,
+                    "is_lunas": is_lunas,
+                    "remaining": rem_after
+                })
+                remaining_pool -= pay_amt
+
+        db.commit()
+
+    total_used = total_pool_available - remaining_pool
+
+    detail_labels = [f"{d['customer_code']}({d['allocated_amount']:,.0f})" for d in settled_details]
+    label_keterangan = f"manual({', '.join(detail_labels)})" if detail_labels else (payload.target_customer_code or "Match Manual")
+
+    temp_used = total_used
+    for idx in payload.selected_mutation_indices:
+        if 0 <= idx < len(records):
+            r = records[idx]
+            nom_awal = float(r.get("original_nominal") if "original_nominal" in r else r.get("nominal", 0.0))
+            if "original_nominal" not in r:
+                r["original_nominal"] = nom_awal
+
+            cur_bal = float(r.get("sisa_nominal") if "sisa_nominal" in r else nom_awal)
+            take = min(temp_used, cur_bal)
+            sisa_baru = cur_bal - take
+            temp_used -= take
+
+            r["sisa_nominal"] = sisa_baru
+            r["used_nominal"] = float(r.get("used_nominal", 0.0)) + take
+            r["settled_details"] = settled_details
+            r["matched_with"] = label_keterangan
+            r["catatan_admin"] = payload.note
+            r["status_matching"] = "MATCHED_MANUAL"
+            
+            if sisa_baru > 1.0:
+                r["has_leftover"] = True
+            else:
+                r["has_leftover"] = False
 
     data["records"] = records
     mb_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -739,18 +1485,24 @@ def batch_manual_match(payload: BatchManualMatchPayload, request: Request, db: S
     db.add(AuditActionLog(
         username=payload.username,
         action_type="MANUAL_MATCH",
-        description=f"Match Manual: {len(payload.selected_mutation_indices)} mutasi CR dipasangkan ke '{payload.target_customer_code or payload.target_receivable_id}' (Total Rp {matched_nominal_total:,.0f})",
+        description=f"Match Manual: {len(payload.selected_mutation_indices)} mutasi CR dipasangkan ke '{label_keterangan}' (Total Terpakai Rp {total_used:,.0f})",
         client_ip=client_ip,
         client_location=client_loc,
         latitude=lat,
         longitude=lon
     ))
     db.commit()
-    return {"status": "SUCCESS", "matched_total": matched_nominal_total}
+
+    sync_audit_report_to_library(payload.audit_date, db)
+    for aff_d in affected_dates:
+        sync_audit_report_to_library(aff_d, db)
+
+    return {"status": "SUCCESS", "matched_total": total_used, "leftover_total": remaining_pool}
 
 
 # ================= MASTER DATA PELANGGAN =================
 class CustomerPayload(BaseModel):
+    customer_id: Optional[int] = None
     customer_code: str
     name: str
     address: str
@@ -775,8 +1527,15 @@ def get_customers(db: Session = Depends(get_db)):
 @router.post("/api/admin/customers")
 def save_customer(payload: CustomerPayload, db: Session = Depends(get_db)):
     code_u = payload.customer_code.strip().upper()
-    cust = db.query(Customer).filter(Customer.customer_code == code_u).first()
+    cust = None
+    if payload.customer_id:
+        cust = db.query(Customer).filter(Customer.id == payload.customer_id).first()
+
+    if not cust:
+        cust = db.query(Customer).filter(Customer.customer_code == code_u).first()
+
     if cust:
+        cust.customer_code = code_u
         cust.name = payload.name.strip()
         cust.address_raw = payload.address.strip()
         cust.address_clean = payload.address.strip()
@@ -790,10 +1549,22 @@ def save_customer(payload: CustomerPayload, db: Session = Depends(get_db)):
             phone=payload.phone.strip()
         ))
     db.commit()
-    return {"status": "SUCCESS"}
+    return {"status": "SUCCESS", "message": f"Data pelanggan '{code_u}' berhasil disimpan!"}
 
 
-# ================= AUDIT LOGS & BERKAS ARSIP =================
+@router.delete("/api/admin/customers/{customer_id}")
+def delete_customer(customer_id: int, db: Session = Depends(get_db)):
+    cust = db.query(Customer).filter(Customer.id == customer_id).first()
+    if not cust:
+        raise HTTPException(status_code=404, detail="Data pelanggan tidak ditemukan")
+
+    code_u = cust.customer_code
+    db.delete(cust)
+    db.commit()
+    return {"status": "SUCCESS", "message": f"Data pelanggan '{code_u}' berhasil dihapus!"}
+
+
+# ================= AUDIT LOGS & ARSIP =================
 @router.get("/api/admin/audit-logs")
 def get_audit_logs(db: Session = Depends(get_db)):
     logs = db.query(AuditActionLog).order_by(AuditActionLog.timestamp.desc()).limit(200).all()
